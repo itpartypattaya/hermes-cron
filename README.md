@@ -1,56 +1,62 @@
 # Hermes Cron Skill
 
-A specialized skill for managing, configuring, and troubleshooting cron jobs (scheduled tasks) in **Hermes Agent**.
+Production-oriented, read-only-first skill for managing scheduled tasks in
+[Hermes Agent](https://github.com/NousResearch/hermes-agent): reminders, recurring
+digests and watchdogs.
 
-This repository contains the complete structured skill ready to be loaded by Hermes Agent or explored as a reference configuration.
+It focuses on the standard Hermes Cron contract. It does not assume a particular
+Git repository, deployment pipeline, user, chat, timezone or delivery target.
 
----
+## Compatibility
 
-## 🇷🇺 Русское описание
+Tested against Hermes Agent 0.21+ semantics:
 
-Специализированный скилл для создания, изменения, приостановки и диагностики cron-задач (задач по расписанию) на платформе **Hermes Agent**.
+- `in 30m` is a one-shot delay;
+- `30m` and `every 30m` are recurring intervals;
+- scheduler output is delivered by the job's delivery layer;
+- `no_agent + script` runs without an LLM.
 
-### Состав проекта
+If your deployment pins an older Hermes version, verify schedule parsing and CLI flags
+before using the examples.
 
-- **`SKILL.md`** — основной файл описания скилла с YAML-метаданными для Hermes. Содержит правила работы с планировщиком, разницу между типами отключения задач (пауза, выключение, удаление) и регламент документирования самоправок.
-- **`scripts/cron-doctor.py`** — скрипт диагностики (`cron-doctor`). Проверяет активность планировщика, расписания, находит аномалии (например, расхождения `enabled/state`) и дрейф рантайма относительно одобренного Git-состояния.
-- **`references/reference.md`** — справочник по всем полям задач, форматам расписаний и целям доставки сообщений.
-- **`references/troubleshooting.md`** — разбор частых сбоев, рунбук по лечению проблем и подробная хроника реальных инцидентов.
-
----
-
-## 🇺🇸 English Description
-
-A production-grade Hermes Agent skill designed to manage the lifecycle of scheduled cron tasks (reminders, monitoring watchdogs, daily digests) and prevent typical scheduler pitfalls.
-
-### Project Structure
-
-- **`SKILL.md`** — the core skill definition file with frontmatter metadata. Houses the operational rules, auto-merge details, and instructions for logging automated self-edits.
-- **`scripts/cron-doctor.py`** — diagnostic CLI tool (`cron-doctor`). Analyzes live `jobs.json` state, identifies runtime anomalies (e.g., mismatched enabled state vs paused scheduler state), and detects drift from the Git-tracked baseline.
-- **`references/reference.md`** — complete schema definition for job fields, schedule formats, and messaging delivery targets.
-- **`references/troubleshooting.md`** — comprehensive runbook detailing common failure modes and resolution paths.
-
----
-
-## Installation / Установка
-
-### 1. In Hermes Agent (as a Skill)
-
-To load this skill into your Hermes Agent instance, clone this repository directly to your profile's `skills` folder:
+## Install
 
 ```bash
 git clone https://github.com/itpartypattaya/hermes-cron.git ~/.hermes/skills/hermes-cron
-```
-
-### 2. Manual Diagnostics (Cron Doctor)
-
-To run the diagnostics tool manually on your server:
-
-```bash
 python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py
 ```
 
-*For a detailed breakdown of a single job:*
+The doctor is standalone: it reads `~/.hermes/cron/jobs.json`, ticker stamps and,
+for a selected job, `executions.db`. It never ticks, executes or changes a job.
+
 ```bash
-python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --job <job_id>
+python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --job <id>
+python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --json
 ```
+
+Exit codes: `0` healthy, `1` findings, `2` unreadable runtime state, `3` invalid
+arguments or an unknown job.
+
+## Scope
+
+The repository contains:
+
+- `SKILL.md` — operating rules for safe creation, changes and diagnosis;
+- `scripts/cron-doctor.py` — portable, read-only health check;
+- `references/` — upstream-oriented field and troubleshooting reference;
+- `tests/` — self-contained doctor regression tests.
+
+GitOps snapshots, three-way merges, persistent configuration, organization-specific
+alert routing and delivery policies are intentionally outside this public skill. Keep
+those rules in a private profile that is loaded alongside `hermes-cron`.
+
+## Test
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## License
+
+No license has been selected for this repository yet. Do not assume permission to
+redistribute or reuse it beyond what copyright law provides.
