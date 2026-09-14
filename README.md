@@ -58,5 +58,4 @@ python3 -m unittest discover -s tests -v
 
 ## License
 
-No license has been selected for this repository yet. Do not assume permission to
-redistribute or reuse it beyond what copyright law provides.
+[MIT](LICENSE)
