@@ -257,8 +257,7 @@ def builtin_doctor(home: Path, enabled: bool):
         return {"ran": False, "reason": "hermes CLI not found (PATH, ~/.local/bin, HERMES_BIN)"}
     try:
         result = subprocess.run(
-            [binary, "cron", "doctor"], env=os.environ | {"HERMES_HOME": str(home), "NO_COLOR": "1"},
-            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            [binary, "cron", "doctor"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ran": False, "reason": f"could not start: {exc}"}

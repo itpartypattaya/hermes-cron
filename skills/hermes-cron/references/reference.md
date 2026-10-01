@@ -37,7 +37,7 @@ hermes cron tick                          # run all due jobs once and exit — n
 | `--no-agent` | no LLM: script stdout is delivered verbatim; `edit` reverses it with `--agent` |
 | `--monitor-script` / `--monitor-url` | change detector; mutually exclusive, incompatible with `--no-agent` |
 | `--continuity` | each run sees its own previous output; `edit` has `--no-continuity` |
-| `--workdir` | working directory: its `AGENTS.md` joins the prompt, cwd for tools |
+| `--workdir` | working directory: its project context files join the prompt, cwd for tools |
 | `--model`, `--provider` | pin a model (the agent's tool cannot set this) |
 | `--pin` | pin the current main model; `edit` has `--unpin` |
 | `--reasoning-effort` | `none` … `ultra` per job |

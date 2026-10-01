@@ -13,7 +13,7 @@ tags: [cron, scheduler, reminders, watchdogs, ops]
 
 Operating rules for Hermes cron: reminders, recurring digests and watchdogs. It covers choosing the
 right lifecycle action, keeping jobs cheap and quiet, verifying every change and diagnosing a job
-that did not fire, fired twice or went to the wrong chat. It does not cover system crontab, GitOps
+that did not fire, fired twice or went to the wrong chat. It does not cover the operating system's cron daemon, GitOps
 layers or delivery policies of a particular installation — keep those in a separate local skill.
 
 ## When to Use
