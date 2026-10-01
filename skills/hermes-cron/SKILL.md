@@ -1,7 +1,7 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.1.0
+version: 1.1.1
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
 compatibility: Hermes Agent >= 0.21 (written against 0.21.5)
@@ -34,21 +34,24 @@ layers or delivery policies of a particular installation — keep those in a sep
 Start every cron task with the read-only doctor through `terminal`:
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/cron-doctor.py              # all jobs
-python3 ${HERMES_SKILL_DIR}/scripts/cron-doctor.py --job <id>   # one job + recent runs
-python3 ${HERMES_SKILL_DIR}/scripts/cron-doctor.py --json       # machine-readable
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py"               # all jobs
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --job <id>    # one job + recent runs
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --json        # machine-readable
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --no-builtin  # strictly read-only
 ```
 
 It runs the built-in `hermes cron doctor` and adds what that check does not cover: ticker stamps,
-disabled and half-paused jobs, failure streaks, delivery
-outcomes from the run history, open failure incidents and pinned models. It never runs or changes
-a job. Exit codes: `0` healthy, `1` findings, `2` unreadable runtime state, `3` bad arguments.
+disabled, malformed and half-paused jobs, failure streaks, the delivery outcome of each job's latest
+completed run, open failure incidents and pinned models. The doctor never runs, edits or removes a
+job; the built-in check it calls loads `jobs.json` through Hermes, which may repair malformed
+entries — `--no-builtin` skips it. Exit codes: `0` healthy, `1` findings (also for `--job`),
+`2` unreadable runtime state, `3` bad arguments or an unknown job.
 
 ## Quick Reference
 
 | The user wants | Action | Check afterwards |
 | --- | --- | --- |
-| "Be quiet until a date" | `pause`, then `resume` on that date | `enabled=false`, `state=paused`, return date told |
+| "Be quiet until a date" | `pause`; say who resumes it and when | `enabled=false`, `state=paused`, resume plan stated |
 | "Create it, but not yet" | create with `paused` + `paused_reason` | created disabled in one write |
 | "Remind me in 30 minutes" | schedule `in 30m` | kind `once`, exact time |
 | "Every 30 minutes" | `30m` or `every 30m` | kind `interval`, next run |
@@ -113,9 +116,9 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
 ## Verification
 
 ```bash
-python3 ${HERMES_SKILL_DIR}/scripts/cron-doctor.py --job <id>
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --job <id>
 ```
 
-The job shows the expected state, schedule, delivery target and `next_run_at`, and its latest run
-has `delivery: delivered` (or the intended silence). Field and CLI reference:
+Exit code `0`: the job shows the expected state, schedule, delivery target and next run, and its
+latest completed run has `delivery: delivered` (or the intended silence). Field and CLI reference:
 `references/reference.md`; symptom runbook: `references/troubleshooting.md`.

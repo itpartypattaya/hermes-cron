@@ -2,13 +2,15 @@
 """Read-only health check for a standard Hermes cron installation.
 
 Complements the built-in `hermes cron doctor` instead of duplicating it: runs it when the CLI is
-available, then adds what it does not look at — ticker stamps, disabled and paused jobs, duplicate ids, half-paused records, consecutive failures,
-delivery outcomes from executions.db, open failure incidents, pinned models and thread-less
-delivery into chats that use threads. Without the CLI (or with --no-builtin) the basic checks the
-built-in would have made — failed last run, undelivered result, overdue next_run_at — run here.
+available, then adds what it does not look at — ticker stamps, disabled and paused jobs, duplicate
+ids, malformed entries, half-paused records, consecutive failures, the delivery outcome of each job's
+latest completed run, open failure incidents, pinned models and thread-less delivery into chats that
+use threads. Without the CLI (or with --no-builtin) the basic checks the built-in would have made —
+failed last run, undelivered result, overdue next_run_at — run here.
 
 The doctor itself never ticks, executes or changes a job. The built-in doctor is Hermes code: its
-job loader, like every scheduler tick, may repair malformed entries in jobs.json.
+job loader, like every scheduler tick, may repair malformed entries in jobs.json; --no-builtin gives
+a strictly read-only pass.
 
 No custom sync or deployment layer is assumed. Exit codes: 0 healthy, 1 findings, 2 unreadable
 runtime state, 3 invalid arguments or an unknown job. Use --json for automation.
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -37,9 +40,14 @@ for _stream in (sys.stdout, sys.stderr):
 
 HEARTBEAT_LIMIT = 180        # the ticker writes a stamp once a minute
 SUCCESS_LIMIT = 600
+FUTURE_SKEW = 300            # a stamp further ahead than this is a clock problem or corruption
 OVERDUE_GRACE = 15 * 60      # same grace as `hermes cron doctor` and `cron status`
 FAILED_STATUSES = {"error", "blocked_config", "interrupted"}
 BAD_DELIVERY = {"failed", "not_configured"}
+INCIDENT_COLUMNS = {"id", "job_id", "state", "error", "last_seen_at"}
+EXECUTION_COLUMNS = {"job_id", "status", "claimed_at"}
+OPTIONAL_RUN_COLUMNS = ("started_at", "finished_at", "error", "delivery_outcome")
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
@@ -53,29 +61,56 @@ def load_json(path: Path):
             return json.load(stream), None
     except FileNotFoundError:
         return None, f"missing {path}"
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:  # ValueError covers JSONDecodeError and UnicodeDecodeError
         return None, f"cannot read {path}: {exc}"
 
 
+def text(value):
+    """The value when it is a string, otherwise None — guards set lookups against lists and dicts."""
+    return value if isinstance(value, str) else None
+
+
 def parse_time(value):
+    """Aware datetime, or None. A timestamp without a zone is ambiguous and returns None."""
     if not isinstance(value, str) or not value:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
-    return parsed if parsed.tzinfo else parsed.astimezone()
+    return parsed if parsed.tzinfo else None
+
+
+def is_naive(value) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is None
+    except ValueError:
+        return False
+
+
+def instant(value):
+    """Sort key that orders mixed UTC offsets by the real moment; unparsable values sort first."""
+    return parse_time(value) or EPOCH
 
 
 def read_stamp(path: Path):
-    """(epoch, pid) from a ticker stamp. Hermes 0.21.5 writes `<epoch> <pid>`, older versions `<epoch>`."""
+    """(epoch, pid, problem). Hermes 0.21.5 writes `<epoch> <pid>`, older versions `<epoch>`."""
     try:
         fields = path.read_text(encoding="utf-8").split()
+    except FileNotFoundError:
+        return None, None, None
+    except (OSError, ValueError) as exc:
+        return None, None, f"cannot read {path.name}: {exc}"
+    try:
         epoch = float(fields[0])
-    except (OSError, ValueError, IndexError):
-        return None, None
+    except (ValueError, IndexError):
+        return None, None, f"{path.name} does not hold a timestamp"
+    if not math.isfinite(epoch) or epoch <= 0:
+        return None, None, f"{path.name} holds an invalid timestamp ({fields[0]})"
     pid = int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else None
-    return epoch, pid
+    return epoch, pid, None
 
 
 def describe_age(seconds):
@@ -88,16 +123,29 @@ def describe_age(seconds):
     return f"{int(seconds // 3600)} h ago"
 
 
+def job_id_of(job) -> str:
+    value = job.get("id")
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return ""
+    return str(value).strip()
+
+
+def tag(job) -> str:
+    name = job.get("name")
+    return f"{job_id_of(job) or '?'} \"{name if isinstance(name, str) else '?'}\""
+
+
 def has_pause_marker(job) -> bool:
-    return job.get("state") == "paused" or bool(job.get("paused_at"))
+    return text(job.get("state")) == "paused" or bool(job.get("paused_at"))
 
 
 def job_state(job):
     enabled = job.get("enabled", True)
     if enabled and has_pause_marker(job):
         return "half-paused"
-    if job.get("state") in {"completed", "error"}:
-        return job["state"]
+    state = text(job.get("state"))
+    if state in {"completed", "error"}:
+        return state
     if not enabled:
         return "paused" if has_pause_marker(job) else "disabled"
     return "enabled"
@@ -105,8 +153,8 @@ def job_state(job):
 
 def pinned_route(job):
     """Model pin: any of provider/model/base_url. Without them the job follows the main model."""
-    values = [str(job.get(key)).strip() for key in ("model", "provider", "base_url")
-              if isinstance(job.get(key), str) and job.get(key).strip()]
+    values = [job[key].strip() for key in ("model", "provider", "base_url")
+              if isinstance(job.get(key), str) and job[key].strip()]
     return " · ".join(values) or None
 
 
@@ -117,63 +165,78 @@ def chat_of(deliver):
     return ":".join(deliver.split(":")[:2])
 
 
+def threaded_chats(jobs):
+    return {chat_of(job.get("deliver")) for job in jobs
+            if isinstance(job.get("deliver"), str) and job["deliver"].count(":") == 2}
+
+
+def analyse_job(job, now, builtin_ran, threaded):
+    findings, notes = [], []
+    label = tag(job)
+    if not job_id_of(job):
+        findings.append(f"{label}: missing or invalid id")
+    schedule = job.get("schedule")
+    if not isinstance(schedule, dict):
+        findings.append(f"{label}: schedule must be an object")
+        return findings, notes
+    kind = text(schedule.get("kind"))
+    if kind not in {"cron", "interval", "once"}:
+        findings.append(f"{label}: unknown schedule.kind={schedule.get('kind')!r}")
+    state = job_state(job)
+    active = state == "enabled"
+    if state == "half-paused":
+        findings.append(f"{label}: enabled=true with a pause marker — Hermes will not run it, "
+                        "yet `cron list` shows it as scheduled; pause or resume it properly")
+    if state == "error":
+        findings.append(f"{label}: state=error — {job.get('last_error') or 'no reason recorded'}")
+    if job.get("no_agent") and not job.get("script"):
+        findings.append(f"{label}: no_agent=true without a script")
+    streak = job.get("failure_streak")
+    if active and isinstance(streak, int) and not isinstance(streak, bool) and streak >= 2:
+        findings.append(f"{label}: {streak} failed runs in a row")
+    status = text(job.get("last_status"))
+    if active and status == "held":
+        notes.append(f"{label}: last_status=held — runs are held until the provider quota recovers")
+    if active and not builtin_ran:
+        # The built-in doctor makes these checks; here they run only when it did not.
+        if status in FAILED_STATUSES:
+            findings.append(f"{label}: last run — {status}: {job.get('last_error') or 'no text'}")
+        if str(job.get("last_delivery_error") or "").strip():
+            findings.append(f"{label}: result not delivered — {job['last_delivery_error']}")
+        raw_next = job.get("next_run_at")
+        nxt = parse_time(raw_next)
+        if is_naive(raw_next):
+            notes.append(f"{label}: next_run_at has no timezone — overdue check skipped")
+        elif kind in {"cron", "interval"} and nxt is None:
+            findings.append(f"{label}: recurring job without next_run_at")
+        elif nxt and (now - nxt).total_seconds() > OVERDUE_GRACE:
+            findings.append(f"{label}: next_run_at is more than 15 minutes overdue")
+    if not active:
+        return findings, notes
+    pin = pinned_route(job)
+    if pin and not job.get("no_agent"):
+        notes.append(f"{label}: pinned model ({pin}) — does not follow `hermes model` "
+                     "and does not use the global fallback chain")
+    deliver = job.get("deliver")
+    if deliver in (None, "", "origin"):
+        notes.append(f"{label}: deliver=origin — check that the actual chat/thread is the text's audience")
+    elif isinstance(deliver, str) and deliver.count(":") == 1 and chat_of(deliver) in threaded:
+        notes.append(f"{label}: deliver={deliver} without a thread although this chat uses threads — "
+                     "the message goes to the general feed")
+    return findings, notes
+
+
 def analyse(jobs, now, builtin_ran):
     findings, notes, seen = [], [], set()
-    threaded = {chat_of(job.get("deliver")) for job in jobs
-                if isinstance(job.get("deliver"), str) and job["deliver"].count(":") == 2}
+    threaded = threaded_chats(jobs)
     for job in jobs:
-        job_id = str(job.get("id", ""))
-        tag = f"{job_id or '?'} \"{job.get('name', '?')}\""
-        if not job_id:
-            findings.append(f"{tag}: missing id")
-        elif job_id in seen:
-            findings.append(f"{tag}: duplicate id")
+        job_id = job_id_of(job)
+        if job_id and job_id in seen:
+            findings.append(f"{tag(job)}: duplicate id")
         seen.add(job_id)
-        schedule = job.get("schedule")
-        if not isinstance(schedule, dict):
-            findings.append(f"{tag}: schedule must be an object")
-            continue
-        kind = schedule.get("kind")
-        if kind not in {"cron", "interval", "once"}:
-            findings.append(f"{tag}: unknown schedule.kind={kind!r}")
-        state = job_state(job)
-        active = state == "enabled"
-        if state == "half-paused":
-            findings.append(f"{tag}: enabled=true with a pause marker — Hermes will not run it, "
-                            "yet `cron list` shows it as scheduled; pause or resume it properly")
-        if state == "error":
-            findings.append(f"{tag}: state=error — {job.get('last_error') or 'no reason recorded'}")
-        if job.get("no_agent") and not job.get("script"):
-            findings.append(f"{tag}: no_agent=true without a script")
-        streak = job.get("failure_streak")
-        if active and isinstance(streak, int) and streak >= 2:
-            findings.append(f"{tag}: {streak} failed runs in a row")
-        status = job.get("last_status")
-        if active and status == "held":
-            notes.append(f"{tag}: last_status=held — runs are held until the provider quota recovers")
-        if active and not builtin_ran:
-            # The built-in doctor makes these checks; here they run only when it did not.
-            if status in FAILED_STATUSES:
-                findings.append(f"{tag}: last run — {status}: {job.get('last_error') or 'no text'}")
-            if str(job.get("last_delivery_error") or "").strip():
-                findings.append(f"{tag}: result not delivered — {job['last_delivery_error']}")
-            nxt = parse_time(job.get("next_run_at"))
-            if kind in {"cron", "interval"} and nxt is None:
-                findings.append(f"{tag}: recurring job without next_run_at")
-            elif nxt and (now - nxt).total_seconds() > OVERDUE_GRACE:
-                findings.append(f"{tag}: next_run_at is more than 15 minutes overdue")
-        if not active:
-            continue
-        pin = pinned_route(job)
-        if pin and not job.get("no_agent"):
-            notes.append(f"{tag}: pinned model ({pin}) — does not follow `hermes model` "
-                         "and does not use the global fallback chain")
-        deliver = job.get("deliver")
-        if deliver in (None, "", "origin"):
-            notes.append(f"{tag}: deliver=origin — check that the actual chat/thread is the text's audience")
-        elif isinstance(deliver, str) and deliver.count(":") == 1 and chat_of(deliver) in threaded:
-            notes.append(f"{tag}: deliver={deliver} without a thread although this chat uses threads — "
-                         "the message goes to the general feed")
+        job_findings, job_notes = analyse_job(job, now, builtin_ran, threaded)
+        findings += job_findings
+        notes += job_notes
     return findings, notes
 
 
@@ -182,9 +245,10 @@ def connect(home: Path):
     if not database.exists():
         return None, "executions.db not found"
     try:
-        return sqlite3.connect(f"file:{database}?mode=ro", uri=True), None
-    except sqlite3.Error as exc:
-        return None, f"cannot read executions.db: {exc}"
+        # as_uri() percent-encodes '#', '?', '%' and non-ASCII characters in the path.
+        return sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True), None
+    except (sqlite3.Error, ValueError) as exc:
+        return None, f"cannot open executions.db: {exc}"
 
 
 def columns(connection, table):
@@ -192,28 +256,51 @@ def columns(connection, table):
 
 
 def history(home: Path):
-    """Open incidents and the latest delivery outcome per job. Older schemas simply lack them."""
+    """Open incidents and each job's latest completed run as (outcome, claimed_at).
+
+    Returns (incidents, delivery, problems, remarks): problems mean the history could not be read and
+    the check is incomplete; remarks are expected gaps such as an older schema. Each table is read on
+    its own, so a damaged incidents table does not hide delivery failures and vice versa.
+    """
     connection, error = connect(home)
     if connection is None:
-        return [], {}, error
-    incidents, delivery = [], {}
+        return [], {}, [], [error]
+    incidents, delivery, problems, remarks = [], {}, [], []
     try:
-        if columns(connection, "cron_incidents"):
-            rows = connection.execute(
-                "select id, job_id, state, error, last_seen_at from cron_incidents "
-                "where state in ('detected', 'alerted') order by last_seen_at desc").fetchall()
-            incidents = [{"id": r[0], "job_id": r[1], "state": r[2], "error": r[3], "last_seen_at": r[4]}
-                         for r in rows]
-        if "delivery_outcome" in columns(connection, "executions"):
-            rows = connection.execute(
-                "select job_id, delivery_outcome, max(claimed_at) from executions "
-                "where status = 'completed' group by job_id").fetchall()
-            delivery = {r[0]: r[1] for r in rows if r[1]}
-    except sqlite3.Error as exc:
-        return incidents, delivery, f"cannot read executions.db: {exc}"
+        try:
+            available = columns(connection, "cron_incidents")
+            if available and INCIDENT_COLUMNS <= available:
+                rows = connection.execute(
+                    "select id, job_id, state, error, last_seen_at from cron_incidents "
+                    "where state in ('detected', 'alerted')").fetchall()
+                incidents = sorted(
+                    ({"id": r[0], "job_id": str(r[1]), "state": r[2], "error": r[3], "last_seen_at": r[4]}
+                     for r in rows),
+                    key=lambda item: instant(item["last_seen_at"]), reverse=True)
+            elif available:
+                remarks.append("cron_incidents has an unexpected schema — incidents not checked")
+        except sqlite3.Error as exc:
+            problems.append(f"cannot read cron_incidents: {exc}")
+        try:
+            available = columns(connection, "executions")
+            if available and EXECUTION_COLUMNS | {"delivery_outcome"} <= available:
+                best = {}
+                for job_id, outcome, claimed, rowid in connection.execute(
+                        "select job_id, delivery_outcome, claimed_at, rowid from executions "
+                        "where status = 'completed'"):
+                    key = (instant(claimed), rowid)
+                    if job_id not in best or key > best[job_id][0]:
+                        best[job_id] = (key, outcome, claimed)
+                delivery = {str(job_id): (outcome, claimed) for job_id, (_, outcome, claimed) in best.items()}
+            elif available and EXECUTION_COLUMNS <= available:
+                remarks.append("executions has no delivery_outcome column — delivery not checked")
+            elif available:
+                remarks.append("executions has an unexpected schema — delivery not checked")
+        except sqlite3.Error as exc:
+            problems.append(f"cannot read executions: {exc}")
     finally:
         connection.close()
-    return incidents, delivery, None
+    return incidents, delivery, problems, remarks
 
 
 def runs(home: Path, job_id: str, limit: int):
@@ -221,21 +308,37 @@ def runs(home: Path, job_id: str, limit: int):
     if connection is None:
         return [], error
     try:
-        extra = ", delivery_outcome" if "delivery_outcome" in columns(connection, "executions") else ", null"
+        available = columns(connection, "executions")
+        if not EXECUTION_COLUMNS <= available:
+            return [], "executions has an unexpected schema"
+        optional = ", ".join(name if name in available else "null" for name in OPTIONAL_RUN_COLUMNS)
         rows = connection.execute(
-            "select claimed_at, started_at, finished_at, status, coalesce(error, '')" + extra +
-            " from executions where job_id = ? order by claimed_at desc limit ?",
-            (job_id, limit),
-        ).fetchall()
+            f"select claimed_at, status, {optional}, rowid from executions where job_id = ?",
+            (job_id,)).fetchall()
     except sqlite3.Error as exc:
-        return [], f"cannot read executions.db: {exc}"
+        return [], f"cannot read executions: {exc}"
     finally:
         connection.close()
+    rows.sort(key=lambda r: (instant(r[0]), r[-1]), reverse=True)
     return [
-        {"claimed_at": r[0], "started_at": r[1], "finished_at": r[2], "status": r[3], "error": r[4],
-         "delivery_outcome": r[5]}
-        for r in rows
+        {"claimed_at": r[0], "status": r[1], "started_at": r[2], "finished_at": r[3],
+         "error": r[4] or "", "delivery_outcome": r[5]}
+        for r in rows[:limit]
     ], None
+
+
+def history_findings(job, incidents, delivery, names):
+    """Findings for one job from the run history: open incidents and an undelivered latest run."""
+    findings, job_id = [], job_id_of(job)
+    for item in incidents:
+        if item["job_id"] == job_id:
+            findings.append(f"open incident {item['id']} — {job_id} \"{names.get(job_id, '?')}\": "
+                            f"{str(item['error'])[:120]} (silence it: hermes cron incidents ack {item['id']})")
+    outcome, claimed = delivery.get(job_id, (None, None))
+    if job_state(job) == "enabled" and outcome in BAD_DELIVERY:
+        findings.append(f"{tag(job)}: latest completed run ({claimed}) was not delivered "
+                        f"(delivery_outcome={outcome})")
+    return findings
 
 
 def hermes_binary():
@@ -249,7 +352,7 @@ def hermes_binary():
     return str(fallback) if fallback.exists() else None
 
 
-def builtin_doctor(home: Path, enabled: bool):
+def builtin_doctor(enabled: bool):
     if not enabled:
         return {"ran": False, "reason": "disabled with --no-builtin"}
     binary = hermes_binary()
@@ -267,18 +370,34 @@ def builtin_doctor(home: Path, enabled: bool):
     return {"ran": True, "exit_code": result.returncode, "output": output}
 
 
+def stamp_age(name, epoch, problem, now):
+    """(age, finding) for one ticker stamp; a stamp far in the future is reported, never shown as fresh."""
+    if problem:
+        return None, problem
+    if epoch is None:
+        return None, None
+    age = now - epoch
+    if age < -FUTURE_SKEW:
+        return None, f"{name} is {int(-age)} s in the future — clock skew or a corrupt stamp"
+    return max(0.0, age), None
+
+
 def ticker(home: Path):
     findings, notes = [], []
-    beat, pid = read_stamp(home / "cron" / "ticker_heartbeat")
-    success, _ = read_stamp(home / "cron" / "ticker_last_success")
     now = time.time()
-    beat_age = None if beat is None else max(0, now - beat)
-    success_age = None if success is None else max(0, now - success)
-    if beat_age is None:
+    beat, pid, beat_problem = read_stamp(home / "cron" / "ticker_heartbeat")
+    success, _, success_problem = read_stamp(home / "cron" / "ticker_last_success")
+    beat_age, beat_finding = stamp_age("ticker_heartbeat", beat, beat_problem, now)
+    success_age, success_finding = stamp_age("ticker_last_success", success, success_problem, now)
+    if beat_finding:
+        findings.append(beat_finding)
+    elif beat_age is None:
         findings.append("no ticker_heartbeat: the scheduler may not have started")
     elif beat_age > HEARTBEAT_LIMIT:
         findings.append(f"stale heartbeat: {int(beat_age)} s")
-    if success_age is None:
+    if success_finding:
+        findings.append(success_finding)
+    elif success_age is None:
         notes.append("no ticker_last_success: check the gateway after its first tick")
     elif success_age > SUCCESS_LIMIT:
         findings.append(f"stale successful tick: {int(success_age)} s")
@@ -286,31 +405,52 @@ def ticker(home: Path):
     return data, findings, notes
 
 
-def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
+def load_jobs(home: Path):
+    """(jobs, structural findings, error). Non-object entries are reported, not silently dropped."""
     payload, error = load_json(home / "cron" / "jobs.json")
     if error:
-        return {"ok": False, "error": error}, 2
+        return None, [], error
     if not isinstance(payload, dict) or not isinstance(payload.get("jobs"), list):
-        return {"ok": False, "error": "jobs.json must be an object with a jobs array"}, 2
-    jobs = [job for job in payload["jobs"] if isinstance(job, dict)]
+        return None, [], "jobs.json must be an object with a jobs array"
+    raw = payload["jobs"]
+    junk = [f"jobs.json entry #{index} is not an object ({type(item).__name__}) — Hermes skips it"
+            for index, item in enumerate(raw) if not isinstance(item, dict)]
+    return [item for item in raw if isinstance(item, dict)], junk, None
+
+
+def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
+    jobs, structure, error = load_jobs(home)
+    if error:
+        return {"ok": False, "error": error}, 2
     now = datetime.now(timezone.utc)
+    names = {job_id_of(job): job.get("name", "?") for job in jobs}
     if selected:
         token = selected.casefold()
-        matched = [job for job in jobs if str(job.get("id", "")).casefold() == token
-                   or str(job.get("name", "")).casefold() == token]
+        matched = [job for job in jobs if job_id_of(job).casefold() == token
+                   or text(job.get("name")) is not None and job["name"].casefold() == token]
         if not matched:
             return {"ok": False, "error": f"job \"{selected}\" not found"}, 3
-        incidents, _, _ = history(home)
-        details = []
+        incidents, delivery, problems, remarks = history(home)
+        threaded = threaded_chats(jobs)
+        details, any_findings = [], bool(problems)
         for job in matched:
-            job_id = str(job.get("id", ""))
+            job_id = job_id_of(job)
+            findings, notes = analyse_job(job, now, False, threaded)
+            if sum(1 for other in jobs if job_id and job_id_of(other) == job_id) > 1:
+                findings.append(f"{tag(job)}: duplicate id")
+            findings += history_findings(job, incidents, delivery, names)
             entries, runs_error = runs(home, job_id, limit)
+            if runs_error:
+                notes.append(runs_error)
+            any_findings = any_findings or bool(findings)
             details.append({"job": job, "derived_state": job_state(job), "pinned": pinned_route(job),
-                            "runs": entries, "runs_error": runs_error,
+                            "findings": findings, "notes": notes, "runs": entries,
                             "incidents": [item for item in incidents if item["job_id"] == job_id]})
-        return {"ok": True, "jobs": details}, 0
-    builtin = builtin_doctor(home, use_builtin)
+        return {"ok": not any_findings, "jobs": details, "history_problems": problems,
+                "history_notes": remarks}, 1 if any_findings else 0
+    builtin = builtin_doctor(use_builtin)
     scheduler, findings, notes = ticker(home)
+    findings += structure
     job_findings, job_notes = analyse(jobs, now, builtin["ran"])
     findings += job_findings
     notes += job_notes
@@ -318,23 +458,16 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
         findings.append("the built-in `hermes cron doctor` reported issues — see its output")
     elif not builtin["ran"]:
         notes.append(f"built-in doctor not run ({builtin['reason']}) — basic checks were done here")
-    incidents, delivery, history_error = history(home)
-    names = {str(job.get("id")): job.get("name", "?") for job in jobs}
-    for item in incidents:
-        findings.append(f"open incident {item['id']} — {item['job_id']} \"{names.get(item['job_id'], '?')}\": "
-                        f"{str(item['error'])[:120]} (silence it: hermes cron incidents ack {item['id']})")
+    incidents, delivery, problems, remarks = history(home)
     for job in jobs:
-        outcome = delivery.get(str(job.get("id")))
-        if job_state(job) == "enabled" and outcome in BAD_DELIVERY:
-            findings.append(f"{job.get('id')} \"{job.get('name', '?')}\": latest run was not delivered "
-                            f"(delivery_outcome={outcome})")
-    if history_error:
-        notes.append(history_error)
+        findings += history_findings(job, incidents, delivery, names)
+    findings += problems
+    notes += remarks
     return {
         "ok": not findings,
         "scheduler": scheduler,
         "builtin": builtin,
-        "jobs": [{"id": job.get("id"), "name": job.get("name"), "state": job_state(job),
+        "jobs": [{"id": job_id_of(job) or None, "name": job.get("name"), "state": job_state(job),
                   "enabled": job.get("enabled", True), "schedule": job.get("schedule"),
                   "next_run_at": job.get("next_run_at"), "last_status": job.get("last_status"),
                   "deliver": job.get("deliver") or "origin", "pinned": pinned_route(job)} for job in jobs],
@@ -342,6 +475,13 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
         "findings": findings,
         "notes": notes,
     }, 1 if findings else 0
+
+
+def print_list(title, items, mark):
+    if items:
+        print(f"\n== {title} ==")
+        for item in items:
+            print(f"  {mark} {item}")
 
 
 def print_human(data):
@@ -367,16 +507,14 @@ def print_human(data):
         print("\n== Findings ==")
         for item in data["findings"] or ["none"]:
             print(f"  {'🔴' if item != 'none' else '✅'} {item}")
-        if data["notes"]:
-            print("\n== Notes ==")
-            for item in data["notes"]:
-                print(f"  ℹ️ {item}")
+        print_list("Notes", data["notes"], "ℹ️")
         return
     for detail in data["jobs"]:
         job = detail["job"]
         print(f"== {job.get('id')} \"{job.get('name')}\" ==")
         print(f"  state: {detail['derived_state']} (enabled={job.get('enabled', True)}, state={job.get('state')})")
         print(f"  schedule: {job.get('schedule_display') or job.get('schedule')}")
+        print(f"  next run: {job.get('next_run_at') or '—'} · last run: {job.get('last_run_at') or '—'}")
         print(f"  delivery: {job.get('deliver') or 'origin'}"
               + (f" · failures: {job['failure_deliver']}" if job.get("failure_deliver") else ""))
         print(f"  model: {detail['pinned'] or 'main model at fire time'}")
@@ -389,15 +527,22 @@ def print_human(data):
         for entry in detail["runs"]:
             outcome = f" · delivery: {entry['delivery_outcome']}" if entry["delivery_outcome"] else ""
             print(f"  {entry['claimed_at']} {entry['status']}{outcome} {entry['error']}".rstrip())
-        for item in detail["incidents"]:
-            print(f"  🔴 incident {item['id']} ({item['state']}): {str(item['error'])[:120]}")
-        if detail["runs_error"]:
-            print(f"  ℹ️ {detail['runs_error']}")
+        for item in detail["findings"] or ["no findings"]:
+            print(f"  {'🔴' if detail['findings'] else '✅'} {item}")
+        for item in detail["notes"]:
+            print(f"  ℹ️ {item}")
+    for item in data.get("history_problems", []):
+        print(f"🔴 {item}")
+    for item in data.get("history_notes", []):
+        print(f"ℹ️ {item}")
 
 
 class Parser(argparse.ArgumentParser):
     def error(self, message):
         # Exit code 2 means "unreadable runtime"; argument errors are 3, as the README promises.
+        if "--json" in sys.argv[1:]:
+            print(json.dumps({"ok": False, "error": f"invalid arguments: {message}"}, ensure_ascii=False))
+            self.exit(3)
         self.print_usage(sys.stderr)
         self.exit(3, f"{self.prog}: error: {message}\n")
 

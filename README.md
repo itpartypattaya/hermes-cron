@@ -81,7 +81,8 @@ cp -r hermes-cron/skills/hermes-cron ~/.hermes/skills/
 Ask the agent in plain words; the skill covers the rest.
 
 - "Remind me in 30 minutes to call the bank." → a one-shot `in 30m`, verified, with the exact time.
-- "Pause the morning digest until Monday." → `pause`, the return date stated, no new duplicate job.
+- "Pause the morning digest until Monday." → `pause`, plus who resumes it on Monday — Hermes has no
+  scheduled resume for recurring jobs — and no new duplicate job.
 - "Ping me only if the disk is over 90 %." → a script-only watchdog, tested for silence and for alert.
 - "Why didn't the 9 am report arrive?" → doctor first, then the layer that broke, then the fix.
 
@@ -94,18 +95,20 @@ python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --json       # for a
 python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --no-builtin # skip `hermes cron doctor`
 ```
 
-Inside the skill the path is `${HERMES_SKILL_DIR}/scripts/cron-doctor.py`, so it works wherever the skill
-is installed. The doctor runs the built-in `hermes cron doctor` when the CLI is found (`PATH`,
+Inside the skill the path is `"${HERMES_SKILL_DIR}/scripts/cron-doctor.py"`, so it works wherever the
+skill is installed. The doctor runs the built-in `hermes cron doctor` when the CLI is found (`PATH`,
 `~/.local/bin` or `HERMES_BIN`) and adds what it does not check:
 
 - ticker heartbeat and last successful tick, with the PID that wrote the stamp;
 - disabled, paused and half-paused jobs — the built-in check looks at active jobs only;
-- duplicate ids, unknown schedule kinds, `no_agent` without a script, failure streaks;
-- the latest `delivery_outcome` of every job and open failure incidents from `executions.db`;
+- duplicate ids, malformed entries, unknown schedule kinds, `no_agent` without a script, failure streaks;
+- the delivery outcome of each job's latest completed run and open failure incidents from
+  `executions.db` (ordered by the real instant, not by timestamp text);
 - pinned models and thread-less delivery into chats that use threads.
 
-Without the CLI it performs the basic checks itself. Exit codes: `0` healthy, `1` findings,
-`2` unreadable runtime state, `3` invalid arguments or an unknown job.
+Without the CLI it performs the basic checks itself. Exit codes: `0` healthy, `1` findings (`--job`
+included), `2` unreadable runtime state, `3` invalid arguments or an unknown job; with `--json`, errors
+are JSON too.
 
 ```text
 == Scheduler ==
