@@ -100,6 +100,7 @@ skill is installed. The doctor runs the built-in `hermes cron doctor` when the C
 `~/.local/bin` or `HERMES_BIN`) and adds what it does not check:
 
 - ticker heartbeat and last successful tick, with the PID that wrote the stamp;
+- a one-line count of jobs by state (`summary` in `--json`);
 - disabled, paused and half-paused jobs — the built-in check looks at active jobs only;
 - duplicate ids, malformed entries, unknown schedule kinds, `no_agent` without a script, failure streaks;
 - the delivery outcome of each job's latest completed run and open failure incidents from
@@ -117,7 +118,11 @@ are JSON too.
 
 == Built-in hermes cron doctor ==
   ✓ Cron doctor found no issues
-    Checked 6 active job(s).
+    Checked 5 active job(s).
+
+== Jobs ==
+  7 total · 4 enabled · 1 half-paused · 1 paused · 1 completed
+  …
 
 == Findings ==
   🔴 3f2a9c1d7e44 "Weekly report": enabled=true with a pause marker — Hermes will not run it,

@@ -151,6 +151,17 @@ def job_state(job):
     return "enabled"
 
 
+STATE_ORDER = ("enabled", "half-paused", "paused", "disabled", "completed", "error")
+
+
+def summarize(jobs):
+    """Job counts by derived state, so "how many jobs are active" needs no extra parsing."""
+    counts = {"total": len(jobs)}
+    for state in STATE_ORDER:
+        counts[state] = sum(1 for job in jobs if job_state(job) == state)
+    return counts
+
+
 def pinned_route(job):
     """Model pin: any of provider/model/base_url. Without them the job follows the main model."""
     values = [job[key].strip() for key in ("model", "provider", "base_url")
@@ -467,6 +478,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
         "ok": not findings,
         "scheduler": scheduler,
         "builtin": builtin,
+        "summary": summarize(jobs),
         "jobs": [{"id": job_id_of(job) or None, "name": job.get("name"), "state": job_state(job),
                   "enabled": job.get("enabled", True), "schedule": job.get("schedule"),
                   "next_run_at": job.get("next_run_at"), "last_status": job.get("last_status"),
@@ -501,7 +513,10 @@ def print_human(data):
                 print(f"  {line}")
         else:
             print(f"  not run: {builtin['reason']}")
+        summary = data["summary"]
         print("\n== Jobs ==")
+        print("  " + " · ".join([f"{summary['total']} total"]
+                                + [f"{summary[state]} {state}" for state in STATE_ORDER if summary[state]]))
         for job in data["jobs"]:
             print(f"  {job['state']:<11} {job['id'] or '?':<14} {job['name'] or '?'} · next: {job['next_run_at'] or '—'}")
         print("\n== Findings ==")
@@ -565,4 +580,11 @@ def main():
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        code = main()
+        sys.stdout.flush()
+    except BrokenPipeError:
+        # The reader went away (for example `| head`); stay quiet instead of printing a traceback.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        code = 1
+    raise SystemExit(code)

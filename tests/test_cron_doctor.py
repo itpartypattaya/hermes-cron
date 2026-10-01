@@ -122,6 +122,27 @@ class CronDoctorTests(unittest.TestCase):
         after = {f.name: hashlib.sha256(f.read_bytes()).hexdigest() for f in sorted((self.home / "cron").iterdir())}
         self.assertEqual(before, after)
 
+    def test_summary_counts_jobs_by_state(self):
+        jobs = [job(id="a"), job(id="b"), job(id="c", enabled=False, state="paused"),
+                job(id="d", enabled=False), job(id="e", enabled=False, state="completed")]
+        result, data = self.payload(jobs)
+        self.assertEqual(data["summary"]["total"], 5)
+        self.assertEqual(data["summary"]["enabled"], 2)
+        self.assertEqual(data["summary"]["paused"], 1)
+        self.assertEqual(data["summary"]["disabled"], 1)
+        self.assertEqual(data["summary"]["completed"], 1)
+        human = self.run_doctor(jobs)
+        self.assertIn("5 total · 2 enabled · 1 paused · 1 disabled · 1 completed", human.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "needs a POSIX shell pipe")
+    def test_closed_pipe_is_quiet(self):
+        self.write_jobs([job(id=str(n)) for n in range(300)])
+        self.stamp("ticker_heartbeat", f"{time.time()} 1")
+        env = os.environ | {"HERMES_HOME": str(self.home)}
+        result = subprocess.run(f'"{sys.executable}" "{SCRIPT}" --no-builtin --json | head -c 10 >/dev/null',
+                                shell=True, env=env, capture_output=True, text=True)
+        self.assertNotIn("Traceback", result.stderr)
+
     # --- ticker stamps --------------------------------------------------------------------------
 
     def test_heartbeat_with_pid_is_fresh(self):
