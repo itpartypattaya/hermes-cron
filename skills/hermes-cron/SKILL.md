@@ -1,7 +1,7 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.1.2
+version: 1.2.0
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
 compatibility: Hermes Agent >= 0.21 (written against 0.21.5)
@@ -42,7 +42,8 @@ python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --no-builtin  # strictly re
 
 It runs the built-in `hermes cron doctor` and adds what that check does not cover: ticker stamps,
 disabled, malformed and half-paused jobs, failure streaks, the delivery outcome of each job's latest
-completed run, open failure incidents and pinned models. The doctor never runs, edits or removes a
+completed run, open failure incidents, one error across three or more jobs in the last 24 h, and
+pinned models. The doctor never runs, edits or removes a
 job; the built-in check it calls loads `jobs.json` through Hermes, which may repair malformed
 entries — `--no-builtin` skips it. Exit codes: `0` healthy, `1` findings (also for `--job`),
 `2` unreadable runtime state, `3` bad arguments or an unknown job.
@@ -110,6 +111,9 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
 - **Failures alert once per incident.** Repeats wait `cron.failure_repeat_alert_hours` (6 h);
   `hermes cron incidents ack <id>` silences one. `[CRON_FAILURE]` on the first line of a reply
   records the run as failed. `last_status=held` is a quota hold, not a bug.
+- **One error in many jobs is one fault.** When the doctor reports the same error across several
+  jobs, fix the scheduler or its host first; editing the jobs one by one changes nothing.
+  `last_status` and `failure_streak` reset on the next good run, so look at the run history.
 - **Persistent writers win.** If a removed or disabled job comes back, a sync or deployment rewrites
   `jobs.json`; change the source of truth, not only the runtime file.
 

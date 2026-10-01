@@ -364,6 +364,55 @@ class CronDoctorTests(unittest.TestCase):
         self.assertFalse(data["builtin"]["ran"])
         self.assertIn("last run — error", " ".join(data["findings"]))
 
+    DISPATCH = ("Restart-safe cron worker dispatch failed: cron external worker exited before "
+                "ownership acknowledgement (exit 1) [execution {}]")
+
+    def failed_runs(self, specs):
+        """(job_id, seconds ago, error) → failed execution rows; the error may hold a per-run id."""
+        rows = []
+        for index, (job_id, ago, error) in enumerate(specs):
+            moment = datetime_iso(-ago)
+            rows.append((f"r{index}", job_id, "failed", moment, moment, moment,
+                         error.format(f"{index:04d}abcdef{index:04d}"), None))
+        return rows
+
+    def test_same_error_in_three_jobs_is_one_finding(self):
+        """The 0.21.3 outage shape: one dispatch error across jobs, all other fields look healthy."""
+        self.executions_db(rows=self.failed_runs(
+            [(name, ago, self.DISPATCH) for name in ("daily", "tick", "backup") for ago in (300, 1800)]))
+        result, data = self.payload([job(), job(id="tick", name="Tick"), job(id="backup", name="Backup")])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertEqual(len(data["shared_failures"]), 1)
+        group = data["shared_failures"][0]
+        self.assertEqual((group["jobs"], group["runs"]), (["backup", "daily", "tick"], 6))
+        findings = " ".join(data["findings"])
+        self.assertIn("the same error failed 3 jobs", findings)
+        self.assertIn("ownership acknowledgement", findings)
+
+    def test_two_jobs_old_runs_and_different_errors_are_not_shared(self):
+        self.executions_db(rows=self.failed_runs([
+            ("daily", 300, self.DISPATCH), ("tick", 300, self.DISPATCH),          # only two jobs
+            ("a", 2 * 86400, "disk full"), ("b", 2 * 86400, "disk full"), ("c", 2 * 86400, "disk full"),
+            ("x", 600, "provider 500"), ("y", 600, "timeout"), ("z", 600, "bad key"),
+        ]))
+        result, data = self.payload([job()])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(data["shared_failures"], [])
+
+    def test_restart_interruptions_are_not_a_fault(self):
+        self.executions_db(rows=self.failed_runs(
+            [(name, 120, "Interrupted by shutdown before terminal completion.")
+             for name in ("daily", "tick", "backup")]))
+        self.assertEqual(self.payload([job()])[1]["shared_failures"], [])
+
+    def test_executions_without_error_column_is_a_note(self):
+        connection = sqlite3.connect(self.home / "cron" / "executions.db")
+        connection.execute("create table executions (id text, job_id text, status text, claimed_at text)")
+        connection.commit()
+        connection.close()
+        result, data = self.payload([job()])
+        self.assertIn("shared failures not checked", " ".join(data["notes"]))
+
 
 if __name__ == "__main__":
     unittest.main()

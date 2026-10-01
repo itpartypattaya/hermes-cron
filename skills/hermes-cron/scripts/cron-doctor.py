@@ -4,9 +4,16 @@
 Complements the built-in `hermes cron doctor` instead of duplicating it: runs it when the CLI is
 available, then adds what it does not look at — ticker stamps, disabled and paused jobs, duplicate
 ids, malformed entries, half-paused records, consecutive failures, the delivery outcome of each job's
-latest completed run, open failure incidents, pinned models and thread-less delivery into chats that
-use threads. Without the CLI (or with --no-builtin) the basic checks the built-in would have made —
-failed last run, undelivered result, overdue next_run_at — run here.
+latest completed run, open failure incidents, the same error across several jobs, pinned models and
+thread-less delivery into chats that use threads. Without the CLI (or with --no-builtin) the basic
+checks the built-in would have made — failed last run, undelivered result, overdue next_run_at — run
+here.
+
+The same error in three or more jobs within a day is reported once, as one fault of the scheduler or
+its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run, and a
+dispatch failure may not open an incident at all — on Hermes 0.21.3 every cron run failed for days
+with "Restart-safe cron worker dispatch failed … exited before ownership acknowledgement" while the
+gateway user had no lingering systemd session, and no job looked broken for long.
 
 The doctor itself never ticks, executes or changes a job. The built-in doctor is Hermes code: its
 job loader, like every scheduler tick, may repair malformed entries in jobs.json; --no-builtin gives
@@ -47,8 +54,24 @@ BAD_DELIVERY = {"failed", "not_configured"}
 INCIDENT_COLUMNS = {"id", "job_id", "state", "error", "last_seen_at"}
 EXECUTION_COLUMNS = {"job_id", "status", "claimed_at"}
 OPTIONAL_RUN_COLUMNS = ("started_at", "finished_at", "error", "delivery_outcome")
+SHARED_WINDOW = 24 * 3600    # how far back failed runs are grouped by error
+SHARED_MIN_JOBS = 3          # this many different jobs with one error = one scheduler or host fault
+FAILED_RUN_STATUSES = ("failed", "unknown")
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
+# Run-specific details that would split one fault into many: timestamps, hex ids, PIDs and ports.
+ERROR_NOISE = (
+    (re.compile(r"\d{4}-\d{2}-\d{2}[t ][\d:.,]+(?:[+-]\d{2}:?\d{2}|z)?"), "<time>"),
+    (re.compile(r"\b[0-9a-f]{8,}\b"), "<id>"),
+    (re.compile(r"\b\d{5,}\b"), "<n>"),
+)
+# A gateway restart interrupts every running job with the same text; that is an intended event,
+# not a broken scheduler (a crash loop shows up in the ticker stamps instead).
+RESTART_ERRORS = (
+    "interrupted by shutdown",
+    "fire claim ownership lost",
+    "scheduler restarted after this execution's owner exited",
+)
 
 
 def hermes_home() -> Path:
@@ -314,6 +337,65 @@ def history(home: Path):
     return incidents, delivery, problems, remarks
 
 
+def error_key(error) -> str:
+    """The error with run-specific details masked, so one fault in many jobs groups into one key."""
+    value = " ".join(str(error or "").lower().split())
+    for pattern, mask in ERROR_NOISE:
+        value = pattern.sub(mask, value)
+    return value[:200]
+
+
+def shared_failures(home: Path, now: datetime):
+    """Errors that failed SHARED_MIN_JOBS or more different jobs within SHARED_WINDOW.
+
+    Returns (groups, problems, remarks); each group is a dict with the first error text seen, the
+    sorted job ids, the number of failed runs and the first and last instant. A missing database is
+    left to history(), which already reports it.
+    """
+    connection, _ = connect(home)
+    if connection is None:
+        return [], [], []
+    try:
+        available = columns(connection, "executions")
+        if not available:
+            return [], [], []
+        if not {"job_id", "status", "claimed_at", "error"} <= available:
+            return [], [], ["executions has no error column — shared failures not checked"]
+        finished = "finished_at" if "finished_at" in available else "null"
+        rows = connection.execute(
+            f"select job_id, error, claimed_at, {finished} from executions "
+            "where status in (?, ?) and coalesce(error, '') != ''", FAILED_RUN_STATUSES).fetchall()
+    except sqlite3.Error as exc:
+        return [], [f"cannot read executions for shared failures: {exc}"], []
+    finally:
+        connection.close()
+    since = now.timestamp() - SHARED_WINDOW
+    groups = {}
+    for job_id, error, claimed, finished_at in rows:
+        moment = parse_time(finished_at) or parse_time(claimed)
+        key = error_key(error)
+        if moment is None or not since <= moment.timestamp() <= now.timestamp() \
+                or key.startswith(RESTART_ERRORS):
+            continue
+        group = groups.setdefault(key, {
+            "error": str(error), "jobs": set(), "runs": 0, "first": moment, "last": moment})
+        group["jobs"].add(str(job_id))
+        group["runs"] += 1
+        group["first"], group["last"] = min(group["first"], moment), max(group["last"], moment)
+    found = [dict(group, jobs=sorted(group["jobs"]), first=group["first"].isoformat(),
+                  last=group["last"].isoformat())
+             for group in groups.values() if len(group["jobs"]) >= SHARED_MIN_JOBS]
+    return sorted(found, key=lambda g: (-len(g["jobs"]), -g["runs"])), [], []
+
+
+def shared_finding(group, names) -> str:
+    listed = ", ".join(f"{job_id} \"{names.get(job_id, '?')}\"" for job_id in group["jobs"][:5])
+    more = f" and {len(group['jobs']) - 5} more" if len(group["jobs"]) > 5 else ""
+    return (f"the same error failed {len(group['jobs'])} jobs in the last 24 h ({group['runs']} runs, "
+            f"{group['first']} … {group['last']}) — the scheduler or its host is broken, not the jobs; "
+            f"fix that first: {group['error'][:200]} · jobs: {listed}{more}")
+
+
 def runs(home: Path, job_id: str, limit: int):
     connection, error = connect(home)
     if connection is None:
@@ -461,6 +543,9 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
                 "history_notes": remarks}, 1 if any_findings else 0
     builtin = builtin_doctor(use_builtin)
     scheduler, findings, notes = ticker(home)
+    shared, shared_problems, shared_remarks = shared_failures(home, now)
+    findings += [shared_finding(group, names) for group in shared] + shared_problems
+    notes += shared_remarks
     findings += structure
     job_findings, job_notes = analyse(jobs, now, builtin["ran"])
     findings += job_findings
@@ -484,6 +569,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
                   "next_run_at": job.get("next_run_at"), "last_status": job.get("last_status"),
                   "deliver": job.get("deliver") or "origin", "pinned": pinned_route(job)} for job in jobs],
         "incidents": incidents,
+        "shared_failures": shared,
         "findings": findings,
         "notes": notes,
     }, 1 if findings else 0

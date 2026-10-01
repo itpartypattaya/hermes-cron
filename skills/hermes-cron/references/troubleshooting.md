@@ -22,6 +22,19 @@ Do not edit the schedule until you know which layer broke.
 key, skill or delivery platform; no LLM call was made and one alert was sent. `last_status=held` means the
 provider reported an exhausted quota and Hermes postponed the run until it recovers — not a bug.
 
+**Many jobs fail with the same error.** One fault, not many: the doctor groups it ("the same error
+failed N jobs in the last 24 h"). Look at the host, the config and the model provider, not at the jobs.
+A known case on systemd installs: since 0.21.3 Hermes starts every cron run outside the gateway through
+`systemd-run --user --scope`, which needs the gateway user's systemd manager. Without lingering that
+manager lives only while someone is logged in, so runs fail whenever the last SSH session closes and work
+again after a login — `Restart-safe cron worker dispatch failed: cron external worker exited before
+ownership acknowledgement (exit 1)`. Check `loginctl show-user <user> -p Linger` and
+`/run/user/<uid>/bus`; the fix is `loginctl enable-linger <user>`, run as root. 0.21.3 cached the probe for the
+process lifetime and opened no incident; 0.21.5 re-probes and names the lost bus; an incident and a
+failure notice for this case arrived after 0.21.5 (#123401). Since `last_status` and `failure_streak`
+reset on the next good run, a daily job that missed three nights can look healthy by morning — read the
+run history (`cron-doctor.py --job <id>`, `hermes cron runs <id>`) and the gateway log.
+
 **The job fired at the wrong time.** A catch-up after a gateway restart (`cron.catch_up_missed`) or after
 `resume`: a slot missed while paused fires once. A re-run 5, 15 or 30 minutes after a network error is the
 built-in retry for an unreachable model. Compare the run time with restarts and `resume`, not only with the

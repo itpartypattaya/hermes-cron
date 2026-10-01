@@ -105,6 +105,10 @@ skill is installed. The doctor runs the built-in `hermes cron doctor` when the C
 - duplicate ids, malformed entries, unknown schedule kinds, `no_agent` without a script, failure streaks;
 - the delivery outcome of each job's latest completed run and open failure incidents from
   `executions.db` (ordered by the real instant, not by timestamp text);
+- the same error in three or more jobs within 24 hours, reported once as a scheduler or host fault
+  (`shared_failures` in `--json`). Per-job fields hide it: they reset on the next good run, and a
+  failed dispatch may open no incident at all. Run ids, timestamps and PIDs are masked before grouping;
+  interruptions by a gateway restart are not counted;
 - pinned models and thread-less delivery into chats that use threads.
 
 Without the CLI it performs the basic checks itself. Exit codes: `0` healthy, `1` findings (`--job`
