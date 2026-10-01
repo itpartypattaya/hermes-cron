@@ -1,0 +1,22 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "hermes-cron",
+  "version": "1.1.0",
+  "description": "Operating skill for Hermes cron jobs: create, change, pause and debug them safely, with a read-only doctor.",
+  "author": {
+    "name": "Anton Vaskov",
+    "url": "https://t.me/passone"
+  },
+  "homepage": "https://github.com/itpartypattaya/hermes-cron",
+  "repository": "https://github.com/itpartypattaya/hermes-cron",
+  "license": "MIT",
+  "keywords": [
+    "hermes",
+    "hermes-agent",
+    "cron",
+    "scheduler",
+    "reminders",
+    "watchdog",
+    "skill"
+  ]
+}

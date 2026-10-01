@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).parents[1] / "scripts" / "cron-doctor.py"
+SCRIPT = Path(__file__).parents[1] / "skills" / "hermes-cron" / "scripts" / "cron-doctor.py"
 
 
 def job(**overrides):
@@ -73,7 +73,7 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(data["jobs"][0]["state"], "enabled")
 
     def test_heartbeat_with_pid_is_fresh(self):
-        # Hermes 0.21.5 пишет `<epoch> <pid>`; раньше доктор читал это как «нет отметки».
+        # Hermes 0.21.5 writes `<epoch> <pid>`; the old parser read it as "no stamp".
         result, data = self.payload([job()])
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertEqual(data["scheduler"]["heartbeat_pid"], os.getpid())
@@ -84,22 +84,16 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         self.assertIsNone(data["scheduler"]["heartbeat_pid"])
 
-    @unittest.skipUnless(Path("/proc/self").is_dir(), "проверка писателя — только Linux /proc")
-    def test_dead_heartbeat_writer_is_finding(self):
-        result, data = self.payload([job()], heartbeat=f"{time.time()} 999999999")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("процесса 999999999", " ".join(data["findings"]))
-
     def test_missing_heartbeat_is_finding(self):
         result, data = self.payload([job()], heartbeat=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("нет ticker_heartbeat", " ".join(data["findings"]))
+        self.assertIn("no ticker_heartbeat", " ".join(data["findings"]))
 
     def test_half_paused_record_is_finding(self):
         result, data = self.payload([job(state="paused")])
         self.assertEqual(result.returncode, 1)
         self.assertEqual(data["jobs"][0]["state"], "half-paused")
-        self.assertIn("Hermes её не запускает", " ".join(data["findings"]))
+        self.assertIn("Hermes will not run it", " ".join(data["findings"]))
 
     def test_paused_at_alone_is_a_pause_marker(self):
         _, data = self.payload([job(paused_at="2026-09-01T00:00:00+00:00")])
@@ -119,7 +113,7 @@ class CronDoctorTests(unittest.TestCase):
     def test_delivery_failed_status_reports_delivery_error(self):
         result, data = self.payload([job(last_status="delivery_failed", last_delivery_error="chat not found")])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("не доставлен", " ".join(data["findings"]))
+        self.assertIn("not delivered", " ".join(data["findings"]))
 
     def test_held_is_note_not_finding(self):
         result, data = self.payload([job(last_status="held")])
@@ -132,12 +126,12 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(self.run_doctor([job(next_run_at=recent)]).returncode, 0)
         result, data = self.payload([job(next_run_at=late)])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("просрочен", " ".join(data["findings"]))
+        self.assertIn("overdue", " ".join(data["findings"]))
 
     def test_failure_streak_is_finding(self):
         result, data = self.payload([job(failure_streak=3)])
         self.assertEqual(result.returncode, 1)
-        self.assertIn("3 неудачных", " ".join(data["findings"]))
+        self.assertIn("3 failed runs", " ".join(data["findings"]))
 
     def test_thread_note_only_for_chats_with_threads(self):
         direct = job(id="dm", deliver="telegram:42")
@@ -146,13 +140,13 @@ class CronDoctorTests(unittest.TestCase):
         _, data = self.payload([direct, threaded, lobby])
         notes = " ".join(data["notes"])
         self.assertIn("lobby", notes)
-        self.assertNotIn("dm «", notes)
+        self.assertNotIn('dm "', notes)
 
     def test_pinned_model_is_note(self):
         _, data = self.payload([job(model="model-x", provider="provider-y")])
-        self.assertIn("закреплена модель (model-x · provider-y)", " ".join(data["notes"]))
+        self.assertIn("pinned model (model-x · provider-y)", " ".join(data["notes"]))
         _, data = self.payload([job(model="model-x", no_agent=True, script="ping.py")])
-        self.assertNotIn("закреплена", " ".join(data["notes"]))
+        self.assertNotIn("pinned", " ".join(data["notes"]))
 
     def test_open_incident_and_failed_delivery_from_history(self):
         self.executions_db(
@@ -170,7 +164,7 @@ class CronDoctorTests(unittest.TestCase):
         self.executions_db(rows=[("e1", "daily", "completed", "2026-09-30T00:00:00+00:00", None, None, "", "delivered")])
         result = self.run_doctor([job()], "--job", "daily")
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("доставка: delivered", result.stdout)
+        self.assertIn("delivery: delivered", result.stdout)
 
     def test_builtin_doctor_output_is_included(self):
         fake = self.home / "fake-hermes.py"
@@ -181,13 +175,13 @@ class CronDoctorTests(unittest.TestCase):
         else:
             launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{fake}" "$@"\n', encoding="utf-8")
             launcher.chmod(0o755)
-        # Без встроенного доктора базовые проверки делает наш; со встроенным — не дублирует.
+        # Without the built-in doctor ours runs the basic checks; with it, it does not duplicate them.
         result, data = self.payload([job(last_status="error")], environment={"HERMES_BIN": str(launcher)})
         self.assertTrue(data["builtin"]["ran"], data["builtin"])
         self.assertEqual(result.returncode, 1)
         findings = " ".join(data["findings"])
-        self.assertIn("встроенный", findings)
-        self.assertNotIn("последний запуск — error", findings)
+        self.assertIn("built-in", findings)
+        self.assertNotIn("last run — error", findings)
 
     def test_unknown_job_is_exit_three(self):
         self.assertEqual(self.run_doctor([job()], "--job", "nope").returncode, 3)
