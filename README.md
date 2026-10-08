@@ -107,9 +107,12 @@ skill is installed. The doctor runs the built-in `hermes cron doctor` when the C
   `executions.db` (ordered by the real instant, not by timestamp text);
 - the same error in three or more jobs within 24 hours, reported once as a scheduler or host fault
   (`shared_failures` in `--json`). Per-job fields hide it: they reset on the next good run, and a
-  failed dispatch may open no incident at all. Run ids, timestamps and PIDs are masked before grouping;
-  interruptions by a gateway restart are not counted;
-- pinned models and thread-less delivery into chats that use threads.
+  failed dispatch may open no incident at all. Run ids, timestamps, measured durations and PIDs are
+  masked before grouping; interruptions by a gateway restart are not counted;
+- pinned models and thread-less delivery into chats that use threads;
+- a cron store this user cannot write, or one with less than 100 MB free: Hermes 0.21.6+ skips due
+  jobs it cannot record. The check reads permission bits and free space and creates no file;
+- the sticky `last_failure` (0.21.6+) of a job that has recovered since, as a note.
 
 Without the CLI it performs the basic checks itself. Exit codes: `0` healthy, `1` findings (`--job`
 included), `2` unreadable runtime state, `3` invalid arguments or an unknown job; with `--json`, errors
@@ -149,11 +152,12 @@ are JSON too.
 
 ## Compatibility
 
-Written and tested against Hermes Agent 0.21.5:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
-- jobs follow the main model at fire time unless pinned;
+- jobs follow `cron.model` or the main model at fire time unless pinned;
+- since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set;
 - a job runs only when `enabled` is true and it carries no pause marker;
 - the ticker heartbeat is `<epoch> <pid>` (older `<epoch>` stamps are still read).
 

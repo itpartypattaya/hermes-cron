@@ -51,7 +51,9 @@ Actions: `create`, `list`, `update`, `pause`, `resume`, `remove`, `run`. Call `l
 handle; `prompt` with `run` is transient context for that fire only. Fields for `create`/`update`:
 `prompt`, `schedule`, `name`, `repeat`, `deliver`, `failure_deliver`, `skills`, `script`, `monitor` (URL or
 script path), `no_agent`, `context_from`, `continuity`, `enabled_toolsets`, `workdir`, `attach_to_session`,
-`pinned`; create only: `paused`, `paused_reason`. On `update`, an empty list or string clears a field.
+`pinned`; create only: `paused`, `paused_reason`. On `update`, an empty string clears a field. Since
+0.21.6 `enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear;
+omit the field for the default set.
 `model`, `provider`, `reasoning_effort` and `interpreter` are CLI-only.
 
 ## Schedules
@@ -80,12 +82,13 @@ expected time.
 | `last_delivery_error`, `last_delivery_unverified` | delivery failed / not confirmed by the adapter |
 | `last_dispatch`, `last_fire_error` | a late or catch-up fire, a dispatch error |
 | `failure_streak` | consecutive failed runs (delivery failures do not count) |
+| `last_failure` | `{at, detail}` of the last failed run; survives later good runs (0.21.6+) |
 | `deliver`, `failure_deliver`, `origin` | result target, failure target, where the job was created |
 | `skills`, `enabled_toolsets` | the agent's skills and tools |
 | `script`, `no_agent`, `monitor_script`, `monitor_url`, `monitor_state` | modes that avoid needless LLM runs |
 | `context_from` | job ids whose latest output is injected (own `continuity` lives here too) |
-| `model`, `provider`, `base_url` | route pin; empty means the main model at fire time |
-| `workdir`, `repeat` | working directory, repeat limit |
+| `model`, `provider`, `base_url` | route pin; empty means `cron.model` or the main model at fire time; a `base_url` needs an explicit `provider` and, for a provider with a stored key, the same scheme, host and port as its endpoint |
+| `workdir`, `repeat` | working directory, repeat limit; re-runs after an unreachable model or a crashed dispatch do not count toward it (0.21.6+) |
 | `fire_claim`, `run_claim` | scheduler leases — who took the run; never edit by hand |
 
 A job runs when `enabled=true` and it has no pause marker (`state=paused` or `paused_at`). `origin` is

@@ -1,10 +1,10 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.2.0
+version: 1.3.0
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (written against 0.21.5)
+compatibility: Hermes Agent >= 0.21 (checked against 0.21.6)
 allowed-tools: cronjob terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---
@@ -42,8 +42,9 @@ python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --no-builtin  # strictly re
 
 It runs the built-in `hermes cron doctor` and adds what that check does not cover: ticker stamps,
 disabled, malformed and half-paused jobs, failure streaks, the delivery outcome of each job's latest
-completed run, open failure incidents, one error across three or more jobs in the last 24 h, and
-pinned models. The doctor never runs, edits or removes a
+completed run, open failure incidents, one error across three or more jobs in the last 24 h, pinned
+models, a cron store that cannot be written or is almost full, and the last failure of a job that has
+recovered since. The doctor never runs, edits or removes a
 job; the built-in check it calls loads `jobs.json` through Hermes, which may repair malformed
 entries — `--no-builtin` skips it. Exit codes: `0` healthy, `1` findings (also for `--job`),
 `2` unreadable runtime state, `3` bad arguments or an unknown job.
@@ -85,7 +86,8 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
 5. Set `deliver` deliberately. Omitted means the chat where the job was created (`origin`), not the
    person the text is for. Explicit form: `platform:chat_id:thread_id`; also `local`, `all`, or
    several targets separated by commas. Route failure notices with `failure_deliver`.
-6. Give only the `enabled_toolsets` the job needs. Leave the model unpinned unless the user asks.
+6. Give only the `enabled_toolsets` the job needs; omit the field for the default set — `[]` means
+   no tools at all. Leave the model unpinned unless the user asks.
 7. After the change, read the job back and run the doctor with `--job <id>`. For a script job, run
    the script once on its own with safe input; for a watchdog, test both silence and the alert.
 8. Report the observed fact: what changed, when it runs next and where the result will go.
@@ -103,7 +105,10 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
   (`cron.allow_agent_scheduling: false`); `messaging` and `clarify` are always off. A cron run that
   "resumed" another job in text did nothing.
 - **Pinned models skip fallback.** A job with `model`, `provider` or `base_url` set ignores
-  `hermes model` and does not use the global fallback chain; unpinned jobs follow the main model.
+  `hermes model` and does not use the global fallback chain; unpinned jobs follow `cron.model`, if set,
+  otherwise the main model.
+- **An empty toolset list is a zero-tool job.** Since 0.21.6 `enabled_toolsets: []` keeps the agent
+  without any tools; it no longer clears the restriction. To return to the default, remove the field.
 - **Monitor output must be stable.** A timestamp in the output makes every tick look changed. The
   first tick always wakes the agent. `monitor` cannot be combined with `no_agent`.
 - **Scripts live in `~/.hermes/scripts/`.** Paths outside it are blocked; `.sh`/`.bash` run in
@@ -113,7 +118,11 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
   records the run as failed. `last_status=held` is a quota hold, not a bug.
 - **One error in many jobs is one fault.** When the doctor reports the same error across several
   jobs, fix the scheduler or its host first; editing the jobs one by one changes nothing.
-  `last_status` and `failure_streak` reset on the next good run, so look at the run history.
+  `last_status` and `failure_streak` reset on the next good run; read the run history, or
+  `last_failure` (0.21.6+), which keeps the time and reason of the last failure.
+- **An unwritable store skips jobs.** On a full disk, a read-only mount or wrong permissions, Hermes
+  0.21.6+ skips due jobs it cannot record; `hermes cron status` leads with a warning. After the fix
+  each skipped job fires once — nothing to resume.
 - **Persistent writers win.** If a removed or disabled job comes back, a sync or deployment rewrites
   `jobs.json`; change the source of truth, not only the runtime file.
 

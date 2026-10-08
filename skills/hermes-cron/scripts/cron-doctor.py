@@ -4,13 +4,15 @@
 Complements the built-in `hermes cron doctor` instead of duplicating it: runs it when the CLI is
 available, then adds what it does not look at — ticker stamps, disabled and paused jobs, duplicate
 ids, malformed entries, half-paused records, consecutive failures, the delivery outcome of each job's
-latest completed run, open failure incidents, the same error across several jobs, pinned models and
-thread-less delivery into chats that use threads. Without the CLI (or with --no-builtin) the basic
+latest completed run, open failure incidents, the same error across several jobs, pinned models,
+thread-less delivery into chats that use threads, a cron store that cannot be written (Hermes 0.21.6+
+then skips due jobs) and the sticky `last_failure` of a job that has recovered since. Without the CLI (or with --no-builtin) the basic
 checks the built-in would have made — failed last run, undelivered result, overdue next_run_at — run
 here.
 
 The same error in three or more jobs within a day is reported once, as one fault of the scheduler or
-its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run, and a
+its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run (only
+`last_failure`, added in 0.21.6, keeps the last failure), and a
 dispatch failure may not open an incident at all — on Hermes 0.21.3 every cron run failed for days
 with "Restart-safe cron worker dispatch failed … exited before ownership acknowledgement" while the
 gateway user had no lingering systemd session, and no job looked broken for long.
@@ -57,12 +59,16 @@ OPTIONAL_RUN_COLUMNS = ("started_at", "finished_at", "error", "delivery_outcome"
 SHARED_WINDOW = 24 * 3600    # how far back failed runs are grouped by error
 SHARED_MIN_JOBS = 3          # this many different jobs with one error = one scheduler or host fault
 FAILED_RUN_STATUSES = ("failed", "unknown")
+RECOVERED_STATUSES = {"ok", "delivery_queued"}
+LOW_FREE_BYTES = 100 << 20   # `hermes doctor` warns below this before store writes start failing
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
-# Run-specific details that would split one fault into many: timestamps, hex ids, PIDs and ports.
+# Run-specific details that would split one fault into many: timestamps, hex ids, measured durations
+# (Hermes 0.21.6 masks them in incident signatures too: "idle for 603s"), PIDs and ports.
 ERROR_NOISE = (
     (re.compile(r"\d{4}-\d{2}-\d{2}[t ][\d:.,]+(?:[+-]\d{2}:?\d{2}|z)?"), "<time>"),
     (re.compile(r"\b[0-9a-f]{8,}\b"), "<id>"),
+    (re.compile(r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"), "<duration>"),
     (re.compile(r"\b\d{5,}\b"), "<n>"),
 )
 # A gateway restart interrupts every running job with the same text; that is an intended event,
@@ -192,6 +198,37 @@ def pinned_route(job):
     return " · ".join(values) or None
 
 
+def recovered_failure(job):
+    """`<at>: <detail>` of the sticky `last_failure` (Hermes 0.21.6+) when the job has run fine since."""
+    failure = job.get("last_failure")
+    if not isinstance(failure, dict) or not str(failure.get("detail") or "").strip():
+        return None
+    if text(job.get("last_status")) not in RECOVERED_STATUSES:
+        return None  # still failing: last_status and last_error already say so
+    return f"{failure.get('at') or '?'}: {str(failure['detail'])[:160]}"
+
+
+def store_findings(cron_dir: Path, writable: bool, free_bytes):
+    """Findings for the cron store. Hermes 0.21.6+ skips a due job whose run it cannot record."""
+    if not writable:
+        return [f"cron store {cron_dir} is not writable by this user — Hermes skips due jobs it cannot "
+                "record; fix permissions or the mount, then each due job fires once"]
+    if free_bytes is not None and free_bytes < LOW_FREE_BYTES:
+        return [f"cron store {cron_dir}: only {free_bytes // (1 << 20)} MB free — when the disk fills up, "
+                "Hermes skips due jobs; free disk space"]
+    return []
+
+
+def store_health(home: Path):
+    """Read-only probe: permission bits and free space. Never creates a file in the store."""
+    cron_dir = home / "cron"
+    try:
+        free = shutil.disk_usage(cron_dir).free
+    except OSError:
+        free = None
+    return store_findings(cron_dir, os.access(cron_dir, os.W_OK | os.X_OK), free)
+
+
 def chat_of(deliver):
     """`platform:chat` for an explicit `platform:chat[:thread]` target, otherwise None."""
     if not isinstance(deliver, str) or deliver.count(":") not in (1, 2) or "," in deliver:
@@ -225,6 +262,9 @@ def analyse_job(job, now, builtin_ran, threaded):
         findings.append(f"{label}: state=error — {job.get('last_error') or 'no reason recorded'}")
     if job.get("no_agent") and not job.get("script"):
         findings.append(f"{label}: no_agent=true without a script")
+    failure = recovered_failure(job)
+    if failure:
+        notes.append(f"{label}: last failure at {failure} — recovered since; read the run history")
     streak = job.get("failure_streak")
     if active and isinstance(streak, int) and not isinstance(streak, bool) and streak >= 2:
         findings.append(f"{label}: {streak} failed runs in a row")
@@ -543,6 +583,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
                 "history_notes": remarks}, 1 if any_findings else 0
     builtin = builtin_doctor(use_builtin)
     scheduler, findings, notes = ticker(home)
+    findings += store_health(home)
     shared, shared_problems, shared_remarks = shared_failures(home, now)
     findings += [shared_finding(group, names) for group in shared] + shared_problems
     notes += shared_remarks
@@ -567,7 +608,8 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
         "jobs": [{"id": job_id_of(job) or None, "name": job.get("name"), "state": job_state(job),
                   "enabled": job.get("enabled", True), "schedule": job.get("schedule"),
                   "next_run_at": job.get("next_run_at"), "last_status": job.get("last_status"),
-                  "deliver": job.get("deliver") or "origin", "pinned": pinned_route(job)} for job in jobs],
+                  "deliver": job.get("deliver") or "origin", "pinned": pinned_route(job),
+                  "last_failure": job.get("last_failure")} for job in jobs],
         "incidents": incidents,
         "shared_failures": shared,
         "findings": findings,
@@ -625,6 +667,9 @@ def print_human(data):
         print(f"  mode: {', '.join(modes) or 'LLM'}")
         print(f"  last status: {job.get('last_status') or '—'}"
               + (f" — {job['last_error']}" if job.get("last_error") else ""))
+        failure = job.get("last_failure")
+        if isinstance(failure, dict) and failure.get("detail"):
+            print(f"  last failure: {failure.get('at') or '?'} — {str(failure['detail'])[:160]}")
         for entry in detail["runs"]:
             outcome = f" · delivery: {entry['delivery_outcome']}" if entry["delivery_outcome"] else ""
             print(f"  {entry['claimed_at']} {entry['status']}{outcome} {entry['error']}".rstrip())

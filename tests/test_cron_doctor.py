@@ -413,6 +413,46 @@ class CronDoctorTests(unittest.TestCase):
         result, data = self.payload([job()])
         self.assertIn("shared failures not checked", " ".join(data["notes"]))
 
+    def test_measured_durations_do_not_split_one_fault(self):
+        """Hermes 0.21.6 masks durations in incident signatures; the doctor groups the same way."""
+        self.executions_db(rows=self.failed_runs([
+            ("daily", 300, "worker idle for 603s, killed"), ("tick", 300, "worker idle for 612s, killed"),
+            ("backup", 300, "worker idle for 1.5 minutes, killed")]))
+        result, data = self.payload([job(), job(id="tick", name="Tick"), job(id="backup", name="Backup")])
+        self.assertEqual(len(data["shared_failures"]), 1, result.stdout)
+
+    # --- Hermes 0.21.6: sticky last_failure, cron store health ---------------------------------
+
+    def test_recovered_last_failure_is_note(self):
+        failure = {"at": "2026-10-07T03:00:00+00:00", "detail": "provider timeout"}
+        result, data = self.payload([job(last_failure=failure)])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("last failure at 2026-10-07T03:00:00+00:00: provider timeout — recovered since",
+                      " ".join(data["notes"]))
+        self.assertEqual(data["jobs"][0]["last_failure"], failure)
+
+    def test_last_failure_of_failing_job_is_not_repeated(self):
+        failure = {"at": "2026-10-07T03:00:00+00:00", "detail": "provider timeout"}
+        _, data = self.payload([job(last_status="error", last_error="provider timeout", last_failure=failure)])
+        self.assertNotIn("recovered since", " ".join(data["notes"]))
+
+    def test_job_detail_shows_last_failure(self):
+        failure = {"at": "2026-10-07T03:00:00+00:00", "detail": "provider timeout"}
+        result = self.run_doctor([job(last_failure=failure)], "--job", "daily")
+        self.assertIn("last failure: 2026-10-07T03:00:00+00:00 — provider timeout", result.stdout)
+
+    def test_store_findings(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cron_doctor", SCRIPT)
+        doctor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(doctor)
+        store = self.home / "cron"
+        self.assertEqual(doctor.store_findings(store, True, 10 << 30), [])
+        self.assertIn("not writable", doctor.store_findings(store, False, 10 << 30)[0])
+        self.assertIn("only 50 MB free", doctor.store_findings(store, True, 50 << 20)[0])
+        self.assertEqual(doctor.store_findings(store, True, None), [])
+        self.assertEqual(doctor.store_health(self.home), [])  # a writable temp dir with free space
+
 
 if __name__ == "__main__":
     unittest.main()
