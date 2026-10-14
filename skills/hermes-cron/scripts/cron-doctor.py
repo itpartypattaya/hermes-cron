@@ -235,7 +235,13 @@ def store_health(home: Path):
         free = shutil.disk_usage(cron_dir).free
     except OSError:
         free = None
-    return store_findings(cron_dir, os.access(cron_dir, os.W_OK | os.X_OK), free)
+    writable = os.access(cron_dir, os.W_OK | os.X_OK)
+    # Hermes also fails a store whose jobs.json target or tick lock it cannot write, even when the
+    # directory itself accepts writes (a root-owned lock in a writable dir skips every run).
+    for target in (Path(os.path.realpath(cron_dir / "jobs.json")), cron_dir / ".tick.lock"):
+        if target.exists() and not os.access(target, os.W_OK):
+            writable = False
+    return store_findings(cron_dir, writable, free)
 
 
 def chat_of(deliver):
@@ -250,7 +256,26 @@ def threaded_chats(jobs):
             if isinstance(job.get("deliver"), str) and job["deliver"].count(":") == 2}
 
 
-def analyse_job(job, now, builtin_ran, threaded):
+def script_issue(script, home):
+    """Why a job's script cannot run, mirroring the built-in check: it must resolve inside the
+    profile's scripts directory and be an existing file. None when it looks fine or home is unknown."""
+    if home is None:
+        return None
+    scripts_dir = (home / "scripts").resolve()
+    raw = Path(script).expanduser()
+    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+    try:
+        path.relative_to(scripts_dir)
+    except ValueError:
+        return f"script resolves outside {scripts_dir}: {script!r}"
+    if not path.exists():
+        return f"script not found: {path}"
+    if not path.is_file():
+        return f"script path is not a file: {path}"
+    return None
+
+
+def analyse_job(job, now, builtin_ran, threaded, home=None):
     findings, notes = [], []
     label = tag(job)
     if not job_id_of(job):
@@ -290,10 +315,20 @@ def analyse_job(job, now, builtin_ran, threaded):
         nxt = parse_time(raw_next)
         if is_naive(raw_next):
             notes.append(f"{label}: next_run_at has no timezone — overdue check skipped")
-        elif kind in {"cron", "interval"} and nxt is None:
-            findings.append(f"{label}: recurring job without next_run_at")
-        elif nxt and (now - nxt).total_seconds() > OVERDUE_GRACE:
+        elif nxt is None:
+            findings.append(f"{label}: active job has no next_run_at")
+        elif (now - nxt).total_seconds() > OVERDUE_GRACE:
             findings.append(f"{label}: next_run_at is more than 15 minutes overdue")
+        fire_error = job.get("last_fire_error")
+        if isinstance(fire_error, dict) and str(fire_error.get("detail") or "").strip():
+            findings.append(f"{label}: last fire did not dispatch — {str(fire_error['detail'])[:160]}")
+        script = str(job.get("script") or "").strip()
+        problem = script_issue(script, home) if script else None
+        if problem:
+            findings.append(f"{label}: {problem}")
+        workdir = str(job.get("workdir") or "").strip()
+        if workdir and not Path(workdir).expanduser().exists():
+            findings.append(f"{label}: workdir not found: {workdir}")
     if not active:
         return findings, notes
     pin = pinned_route(job)
@@ -309,7 +344,7 @@ def analyse_job(job, now, builtin_ran, threaded):
     return findings, notes
 
 
-def analyse(jobs, now, builtin_ran):
+def analyse(jobs, now, builtin_ran, home=None):
     findings, notes, seen = [], [], set()
     threaded = threaded_chats(jobs)
     for job in jobs:
@@ -317,7 +352,7 @@ def analyse(jobs, now, builtin_ran):
         if job_id and job_id in seen:
             findings.append(f"{tag(job)}: duplicate id")
         seen.add(job_id)
-        job_findings, job_notes = analyse_job(job, now, builtin_ran, threaded)
+        job_findings, job_notes = analyse_job(job, now, builtin_ran, threaded, home)
         findings += job_findings
         notes += job_notes
     return findings, notes
@@ -347,7 +382,8 @@ def history(home: Path):
     """
     connection, error = connect(home)
     if connection is None:
-        return [], {}, [], [error]
+        missing = not (home / "cron" / "executions.db").exists()
+        return [], {}, ([] if missing else [error]), ([error] if missing else [])
     incidents, delivery, problems, remarks = [], {}, [], []
     try:
         try:
@@ -508,7 +544,7 @@ def builtin_doctor(enabled: bool, profile=None):
         return {"ran": False, "reason": f"could not start: {exc}"}
     output = ANSI.sub("", (result.stdout + result.stderr)).strip()
     if result.returncode not in (0, 1):
-        return {"ran": False, "reason": f"exit code {result.returncode}: {output[-300:]}"}
+        return {"ran": False, "failed": True, "reason": f"exit code {result.returncode}: {output[-300:]}"}
     return {"ran": True, "exit_code": result.returncode, "output": output}
 
 
@@ -592,7 +628,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
     if error:
         return {"ok": False, "error": error}, 2
     now = datetime.now(timezone.utc)
-    names = {job_id_of(job): job.get("name", "?") for job in jobs}
+    names = {job_id_of(job): (job["name"] if isinstance(job.get("name"), str) else "?") for job in jobs}
     if selected:
         token = selected.casefold()
         matched = [job for job in jobs if job_id_of(job).casefold() == token
@@ -604,7 +640,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
         details, any_findings = [], bool(problems)
         for job in matched:
             job_id = job_id_of(job)
-            findings, notes = analyse_job(job, now, False, threaded)
+            findings, notes = analyse_job(job, now, False, threaded, home)
             if sum(1 for other in jobs if job_id and job_id_of(other) == job_id) > 1:
                 findings.append(f"{tag(job)}: duplicate id")
             findings += history_findings(job, incidents, delivery, names)
@@ -624,11 +660,14 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
     findings += [shared_finding(group, names) for group in shared] + shared_problems
     notes += shared_remarks
     findings += structure
-    job_findings, job_notes = analyse(jobs, now, builtin["ran"])
+    job_findings, job_notes = analyse(jobs, now, builtin["ran"], home)
     findings += job_findings
     notes += job_notes
     if builtin["ran"] and builtin["exit_code"] == 1:
         findings.append("the built-in `hermes cron doctor` reported issues — see its output")
+    elif builtin.get("failed"):
+        findings.append(f"the built-in `hermes cron doctor` failed ({builtin['reason']}) — check the Hermes "
+                        "install and config; basic checks were done here")
     elif not builtin["ran"]:
         notes.append(f"built-in doctor not run ({builtin['reason']}) — basic checks were done here")
     incidents, delivery, problems, remarks = history(home)

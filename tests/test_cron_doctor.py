@@ -432,6 +432,71 @@ class CronDoctorTests(unittest.TestCase):
         _, data = self.payload([job()], write=False, heartbeat=False)
         self.assertIn("holds no message", " ".join(data["findings"]))
 
+    # --- checks the built-in doctor makes, repeated for --job and without it ---------------------
+
+    def test_crashed_builtin_doctor_is_finding(self):
+        launcher, _ = self.fake_hermes(2)
+        result, data = self.payload([job()], environment={"HERMES_BIN": str(launcher)})
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertFalse(data["builtin"]["ran"])
+        self.assertIn("built-in `hermes cron doctor` failed (exit code 2", " ".join(data["findings"]))
+
+    def test_active_one_shot_without_next_run_is_finding(self):
+        once = job(schedule={"kind": "once", "run_at": "2099-01-01T09:00:00+00:00"}, next_run_at=None)
+        _, data = self.payload([once])
+        self.assertIn("active job has no next_run_at", " ".join(data["findings"]))
+
+    def test_job_detail_checks_script_workdir_and_fire_error(self):
+        (self.home / "scripts").mkdir()
+        (self.home / "scripts" / "ok.py").write_text("print('x')\n", encoding="utf-8")
+        broken = job(script="missing.py", workdir=str(self.home / "no-such-dir"),
+                     last_fire_error={"at": "2026-10-14T03:00:00+00:00", "detail": "worker exited before ack"})
+        result = self.run_doctor([broken], "--job", "daily")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("script not found", result.stdout)
+        self.assertIn("workdir not found", result.stdout)
+        self.assertIn("last fire did not dispatch — worker exited before ack", result.stdout)
+        result = self.run_doctor([job(script="ok.py")], "--job", "daily")
+        self.assertNotIn("script", " ".join(line for line in result.stdout.splitlines() if "🔴" in line))
+
+    def test_script_outside_scripts_dir_is_finding(self):
+        (self.home / "scripts").mkdir()
+        _, data = self.payload([job(script="../outside.py")])
+        self.assertIn("script resolves outside", " ".join(data["findings"]))
+
+    def test_unopenable_executions_db_is_finding(self):
+        (self.home / "cron" / "executions.db").mkdir()  # exists, but is not a database
+        result, data = self.payload([job()])
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("executions", " ".join(data["findings"]))
+
+    def test_missing_executions_db_is_only_a_note(self):
+        result, data = self.payload([job()])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("executions.db not found", " ".join(data["notes"]))
+
+    def test_read_only_tick_lock_makes_store_unwritable(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cron_doctor", SCRIPT)
+        doctor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(doctor)
+        lock = self.home / "cron" / ".tick.lock"
+        lock.write_text("", encoding="utf-8")
+        lock.chmod(0o444)
+        try:
+            if os.access(lock, os.W_OK):
+                self.skipTest("running as a user that ignores file modes")
+            self.assertIn("not writable", " ".join(doctor.store_health(self.home)))
+        finally:
+            lock.chmod(0o644)
+
+    def test_null_name_prints_as_question_mark(self):
+        self.executions_db(incidents=[("i1", "daily", "sig", "alerted", "boom", datetime_iso(-60), datetime_iso(-60))])
+        _, data = self.payload([job(name=None)])
+        findings = " ".join(data["findings"])
+        self.assertIn('daily "?"', findings)
+        self.assertNotIn('"None"', findings)
+
     def test_missing_cli_falls_back_to_basic_checks(self):
         missing = str(self.home / "no-such-hermes")
         result, data = self.payload([job(last_status="error")], environment={"HERMES_BIN": missing})

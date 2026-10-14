@@ -1,7 +1,7 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.4.0
+version: 1.4.1
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
 compatibility: Hermes Agent >= 0.21 (checked against 0.22.0)
@@ -78,11 +78,14 @@ How to keep a job from waking the model in vain:
 
 Memory between runs: `continuity: true` shows each run its own previous output; `context_from`
 injects another job's last output; `hermes cron notepad <id> set <key> <value>` keeps small
-cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
+cursors (key up to 128 characters, 16 KB per value, 64 KB per job; an oversized write is refused and
+saves nothing) that are injected into the prompt. There is no notepad tool: a run writes it through
+`terminal`.
 
 ## Procedure
 
-1. Run the doctor. A list without `--all` shows active jobs only: "not in the list" is not "absent".
+1. Run the doctor. A list without `--all` hides disabled jobs (paused ones are shown, marked
+   `[paused]`): "not in the list" is not "absent".
 2. Look for a duplicate by meaning — schedule, delivery target, script, purpose — not by name.
    "Set a reminder" often means an existing job is paused or broken; update it instead.
 3. Pick the lifecycle action and the cheapest mode from the tables above.

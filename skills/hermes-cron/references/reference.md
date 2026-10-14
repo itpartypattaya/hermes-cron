@@ -6,7 +6,7 @@ separate profile skill, not here. On another version, check flags with `hermes c
 ## CLI
 
 ```bash
-hermes cron list [--all]                  # without --all: active jobs only
+hermes cron list [--all]                  # without --all: enabled and paused jobs; --all adds disabled
 hermes cron status                        # gateway, heartbeat, next run
 hermes cron doctor                        # built-in check of active jobs
 hermes cron create "in 30m" "Remind me to check the backup" [--name ...]
@@ -54,8 +54,10 @@ Actions: `create`, `list`, `update`, `pause`, `resume`, `remove`, `run`. Call `l
 handle; `prompt` with `run` is transient context for that fire only. Fields for `create`/`update`:
 `prompt`, `schedule`, `name`, `repeat`, `deliver`, `failure_deliver`, `skills`, `script`, `monitor` (URL or
 script path), `no_agent`, `context_from`, `continuity`, `enabled_toolsets`, `workdir`, `attach_to_session`,
-`pinned`; create only: `paused`, `paused_reason`. On `update`, an empty string clears a field. Since
-0.21.6 `enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear;
+`pinned`; create only: `paused`, `paused_reason`. Clearing on `update`: string fields (`failure_deliver`,
+`monitor`, `workdir`, `script`) take `""`; list fields (`skills`, `context_from`) take `[]`; a blank
+`name` is ignored, not cleared; `continuity: false` turns continuity off. Since 0.21.6
+`enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear;
 omit the field for the default set.
 `model`, `provider`, `reasoning_effort` and `interpreter` are CLI-only.
 
@@ -90,7 +92,7 @@ expected time.
 | `skills`, `enabled_toolsets` | the agent's skills and tools |
 | `script`, `no_agent`, `monitor_script`, `monitor_url`, `monitor_state` | modes that avoid needless LLM runs |
 | `context_from` | job ids whose latest output is injected (own `continuity` lives here too) |
-| `model`, `provider`, `base_url` | route pin; empty means `cron.model` or the main model at fire time; a `base_url` needs an explicit `provider` and, for a provider with a stored key, the same scheme, host and port as its endpoint |
+| `model`, `provider`, `base_url` | route pin (`base_url` has no CLI flag: set it in `jobs.json`); empty means `cron.model` or the main model at fire time; a `base_url` needs an explicit `provider` and, for a provider with a stored key, the same scheme, host and port as its endpoint |
 | `workdir`, `repeat` | working directory, repeat limit; re-runs after an unreachable model or a crashed dispatch do not count toward it (0.21.6+) |
 | `fire_claim`, `run_claim` | scheduler leases — who took the run; never edit by hand |
 

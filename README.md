@@ -116,7 +116,10 @@ skill is installed. The doctor runs the built-in `hermes cron doctor` when the C
   jobs it cannot record. The check reads permission bits and free space and creates no file;
 - the sticky `last_failure` (0.21.6+) of a job that has recovered since, as a note.
 
-Without the CLI it performs the basic checks itself. Exit codes: `0` healthy, `1` findings (`--job`
+Without the CLI, and always for `--job`, it performs the basic checks itself: failed last run, undelivered
+result, a missing or overdue `next_run_at`, a failed dispatch, a script outside the scripts directory or
+missing, a missing working directory. A built-in doctor that crashes, or a run history that exists but
+cannot be read, is a finding, not a note. Exit codes: `0` healthy, `1` findings (`--job`
 included), `2` unreadable runtime state, `3` invalid arguments or an unknown job; with `--json`, errors
 are JSON too.
 
