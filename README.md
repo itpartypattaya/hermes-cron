@@ -93,13 +93,15 @@ python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py              # all j
 python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --job <id>   # one job + recent runs
 python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --json       # for automation
 python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --no-builtin # skip `hermes cron doctor`
+python3 ~/.hermes/skills/hermes-cron/scripts/cron-doctor.py --profile work # jobs of a named profile
 ```
 
 Inside the skill the path is `"${HERMES_SKILL_DIR}/scripts/cron-doctor.py"`, so it works wherever the
 skill is installed. The doctor runs the built-in `hermes cron doctor` when the CLI is found (`PATH`,
 `~/.local/bin` or `HERMES_BIN`) and adds what it does not check:
 
-- ticker heartbeat and last successful tick, with the PID that wrote the stamp;
+- ticker heartbeat and last successful tick, with the PID that wrote the stamp, and the error of a
+  failed tick (`ticker_last_error`);
 - a one-line count of jobs by state (`summary` in `--json`);
 - disabled, paused and half-paused jobs — the built-in check looks at active jobs only;
 - duplicate ids, malformed entries, unknown schedule kinds, `no_agent` without a script, failure streaks;
@@ -152,12 +154,15 @@ are JSON too.
 
 ## Compatibility
 
-Written against Hermes Agent 0.21.5 and checked against 0.21.6:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6 and 0.22.0:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
 - jobs follow `cron.model` or the main model at fire time unless pinned;
 - since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set;
+- the agent tool is `cronjob_manage` (old name `cronjob`) and is loaded on demand through `tool_search`;
+- one gateway serves every profile; a named profile's jobs live in `~/.hermes/profiles/<name>/` —
+  `--profile <name>` points the doctor there;
 - a job runs only when `enabled` is true and it carries no pause marker;
 - the ticker heartbeat is `<epoch> <pid>` (older `<epoch>` stamps are still read).
 

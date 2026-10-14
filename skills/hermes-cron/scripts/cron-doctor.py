@@ -2,27 +2,28 @@
 """Read-only health check for a standard Hermes cron installation.
 
 Complements the built-in `hermes cron doctor` instead of duplicating it: runs it when the CLI is
-available, then adds what it does not look at — ticker stamps, disabled and paused jobs, duplicate
-ids, malformed entries, half-paused records, consecutive failures, the delivery outcome of each job's
-latest completed run, open failure incidents, the same error across several jobs, pinned models,
-thread-less delivery into chats that use threads, a cron store that cannot be written (Hermes 0.21.6+
-then skips due jobs) and the sticky `last_failure` of a job that has recovered since. Without the CLI (or with --no-builtin) the basic
-checks the built-in would have made — failed last run, undelivered result, overdue next_run_at — run
-here.
+available, then adds what it does not look at — ticker stamps and the last tick error, disabled and
+paused jobs, duplicate ids, malformed entries, half-paused records, consecutive failures, the
+delivery outcome of each job's latest completed run, open failure incidents, the same error across
+several jobs, pinned models, thread-less delivery into chats that use threads, a cron store that
+cannot be written (Hermes 0.21.6+ then skips due jobs) and the sticky `last_failure` of a job that
+has recovered since. Without the CLI (or with --no-builtin) the basic checks the built-in would have
+made — failed last run, undelivered result, overdue next_run_at — run here.
 
 The same error in three or more jobs within a day is reported once, as one fault of the scheduler or
-its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run (only
-`last_failure`, added in 0.21.6, keeps the last failure), and a
-dispatch failure may not open an incident at all — on Hermes 0.21.3 every cron run failed for days
-with "Restart-safe cron worker dispatch failed … exited before ownership acknowledgement" while the
-gateway user had no lingering systemd session, and no job looked broken for long.
+its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run
+(only `last_failure`, added in 0.21.6, keeps the last failure), and a dispatch failure may not open
+an incident at all — on Hermes 0.21.3 every cron run failed for days with "Restart-safe cron worker
+dispatch failed … exited before ownership acknowledgement" while the gateway user had no lingering
+systemd session, and no job looked broken for long.
 
 The doctor itself never ticks, executes or changes a job. The built-in doctor is Hermes code: its
 job loader, like every scheduler tick, may repair malformed entries in jobs.json; --no-builtin gives
 a strictly read-only pass.
 
-No custom sync or deployment layer is assumed. Exit codes: 0 healthy, 1 findings, 2 unreadable
-runtime state, 3 invalid arguments or an unknown job. Use --json for automation.
+--profile <name> reads a named profile (<hermes home>/profiles/<name>) and passes the profile to the
+built-in doctor. No custom sync or deployment layer is assumed. Exit codes: 0 healthy, 1 findings, 2
+unreadable runtime state, 3 invalid arguments or an unknown job. Use --json for automation.
 """
 from __future__ import annotations
 
@@ -60,6 +61,7 @@ SHARED_WINDOW = 24 * 3600    # how far back failed runs are grouped by error
 SHARED_MIN_JOBS = 3          # this many different jobs with one error = one scheduler or host fault
 FAILED_RUN_STATUSES = ("failed", "unknown")
 RECOVERED_STATUSES = {"ok", "delivery_queued"}
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,63}")
 LOW_FREE_BYTES = 100 << 20   # `hermes doctor` warns below this before store writes start failing
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 ANSI = re.compile(r"\x1b\[[0-9;]*m")
@@ -82,6 +84,13 @@ RESTART_ERRORS = (
 
 def hermes_home() -> Path:
     return Path(os.environ.get("HERMES_HOME") or os.environ.get("HERMES_DIR") or "~/.hermes").expanduser()
+
+
+def default_home(home: Path) -> Path:
+    """The root home that holds `profiles/`, even when HERMES_HOME already points at a profile."""
+    if home.parent.name == "profiles" and PROFILE_NAME.fullmatch(home.name):
+        return home.parent.parent
+    return home
 
 
 def load_json(path: Path):
@@ -485,7 +494,7 @@ def hermes_binary():
     return str(fallback) if fallback.exists() else None
 
 
-def builtin_doctor(enabled: bool):
+def builtin_doctor(enabled: bool, profile=None):
     if not enabled:
         return {"ran": False, "reason": "disabled with --no-builtin"}
     binary = hermes_binary()
@@ -493,7 +502,7 @@ def builtin_doctor(enabled: bool):
         return {"ran": False, "reason": "hermes CLI not found (PATH, ~/.local/bin, HERMES_BIN)"}
     try:
         result = subprocess.run(
-            [binary, "cron", "doctor"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
+            [binary, *(["--profile", profile] if profile else []), "cron", "doctor"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return {"ran": False, "reason": f"could not start: {exc}"}
@@ -534,8 +543,35 @@ def ticker(home: Path):
         notes.append("no ticker_last_success: check the gateway after its first tick")
     elif success_age > SUCCESS_LIMIT:
         findings.append(f"stale successful tick: {int(success_age)} s")
-    data = {"heartbeat_age_seconds": beat_age, "heartbeat_pid": pid, "success_age_seconds": success_age}
+    error_at, error_text, error_problem = read_tick_error(home / "cron" / "ticker_last_error")
+    if error_problem:
+        findings.append(error_problem)
+    elif error_text and (success is None or error_at is None or error_at > success):
+        when = describe_age(max(0.0, now - error_at)) if error_at else "time unknown"
+        findings.append(f"the last tick failed ({when}): {error_text[:200]}")
+    data = {"heartbeat_age_seconds": beat_age, "heartbeat_pid": pid, "success_age_seconds": success_age,
+            "last_tick_error": error_text}
     return data, findings, notes
+
+
+def read_tick_error(path: Path):
+    """(epoch, message, problem) of `ticker_last_error`: `<epoch>` then the message. Hermes removes the
+    file after the next successful tick, so a present file means the latest tick failed. Only a missing
+    file means "no error"; a file that cannot be read is a problem, not silence."""
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return None, None, None
+    except (OSError, ValueError) as exc:
+        return None, None, f"cannot read ticker_last_error: {exc}"
+    message = "\n".join(lines[1:]).strip()
+    if not message:
+        return None, None, "ticker_last_error holds no message — the last tick may have failed"
+    try:
+        epoch = float(lines[0])
+    except ValueError:
+        epoch = None
+    return (epoch if epoch is not None and math.isfinite(epoch) and epoch > 0 else None), message, None
 
 
 def load_jobs(home: Path):
@@ -551,7 +587,7 @@ def load_jobs(home: Path):
     return [item for item in raw if isinstance(item, dict)], junk, None
 
 
-def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
+def report(home: Path, selected: str | None, limit: int, use_builtin: bool, profile=None):
     jobs, structure, error = load_jobs(home)
     if error:
         return {"ok": False, "error": error}, 2
@@ -581,7 +617,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool):
                             "incidents": [item for item in incidents if item["job_id"] == job_id]})
         return {"ok": not any_findings, "jobs": details, "history_problems": problems,
                 "history_notes": remarks}, 1 if any_findings else 0
-    builtin = builtin_doctor(use_builtin)
+    builtin = builtin_doctor(use_builtin, profile)
     scheduler, findings, notes = ticker(home)
     findings += store_health(home)
     shared, shared_problems, shared_remarks = shared_failures(home, now)
@@ -699,10 +735,23 @@ def main():
     parser.add_argument("--runs", type=int, default=10, help="number of runs to show with --job")
     parser.add_argument("--json", action="store_true", help="stable JSON for automation")
     parser.add_argument("--no-builtin", action="store_true", help="do not run `hermes cron doctor`")
+    parser.add_argument("--profile", help="named profile: read <hermes home>/profiles/<name>")
     args = parser.parse_args()
     if args.runs < 1:
         parser.error("--runs must be positive")
-    data, code = report(hermes_home(), args.job, args.runs, not args.no_builtin)
+    home, profile = hermes_home(), None
+    if args.profile:
+        # Same rules as Hermes: lowercase id, `default` is the root home; both resolve from the root
+        # home, so HERMES_HOME pointing at another profile does not change the target.
+        profile = args.profile.strip().lower()
+        home = default_home(home)
+        if profile != "default":
+            if not PROFILE_NAME.fullmatch(profile):
+                parser.error(f"invalid profile name: {args.profile!r}")
+            home = home / "profiles" / profile
+            if not home.is_dir():
+                parser.error(f"profile not found: {home}")
+    data, code = report(home, args.job, args.runs, not args.no_builtin, profile)
     if args.json:
         print(json.dumps(data, ensure_ascii=False, indent=2, default=str))
     else:

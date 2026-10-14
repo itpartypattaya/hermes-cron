@@ -44,7 +44,10 @@ hermes cron tick                          # run all due jobs once and exit — n
 | `--interpreter` | Python from your own venv for a `.py` script |
 | `--paused`, `--paused-reason` | create disabled in one write, with a reason |
 
-## The `cronjob` tool
+## The `cronjob_manage` tool
+
+The old name `cronjob` still works; the toolset is called `cronjob`. Hermes loads this tool on demand
+(`tools.tool_search.defer`): when it is missing from the tool list, call `tool_search` for it first.
 
 Actions: `create`, `list`, `update`, `pause`, `resume`, `remove`, `run`. Call `list` before
 `update`/`pause`/`resume`/`remove`/`run`; never guess ids. `run` happens in the background and returns a
@@ -148,6 +151,10 @@ the global `fallback_providers` chain.
 - **Gateway guard.** A job that restarts or stops the gateway is rejected at creation.
 - **Webhook.** A route `platforms.webhook.extra.routes.<name>.cron_job: <id>` fires an existing job per
   event; the event body becomes transient context for that run.
+- **Loop guardrails.** Unattended (cron, gateway) runs hard-stop repeated failing tool calls
+  (`tool_loop_guardrails.hard_stop_after`): `exact_failure` 5 — the same call failing the same way,
+  `same_tool_failure` 8 — one tool failing with any arguments, `idempotent_no_progress` 5 — the same
+  read-only call repeated without new results. A sequence of different tools is not affected.
 - **Self-removal.** If a run removes its own job with the tool, its final reply is still delivered. From
   a cron session this is possible only with `allow_agent_scheduling: true`.
 
@@ -162,5 +169,9 @@ the global `fallback_providers` chain.
 | `~/.hermes/cron/output/<job_id>/` | saved run output |
 | `~/.hermes/cron/ticker_heartbeat` | `<epoch> <pid>` of the last tick; the PID is the writer |
 | `~/.hermes/cron/ticker_last_success` | time of the last successful tick |
+| `~/.hermes/cron/ticker_last_error` | `<epoch>` and the error of a failed tick; removed after the next good tick |
 | `~/.hermes/scripts/` | job scripts; anything outside is blocked |
 | `~/.hermes/logs/agent.log` | scheduler and delivery logs |
+
+A named profile keeps the same files under `~/.hermes/profiles/<name>/`. Since 0.22 one gateway per
+machine serves all profiles and runs each profile's jobs with that profile's environment and secrets.

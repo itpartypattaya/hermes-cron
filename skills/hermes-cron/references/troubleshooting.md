@@ -31,6 +31,16 @@ is needed, and each job that stayed due fires once on the next tick.
 **A job lost all its tools.** Since 0.21.6 `enabled_toolsets: []` means "no tools", not "default tools".
 Remove the field, or list the toolsets the job needs.
 
+**The tick runs but fails.** `hermes cron status` and the doctor show the last tick error from
+`ticker_last_error` (a locked database, a broken `jobs.json`, a full disk). Fix that error; the file
+disappears after the next good tick.
+
+**The job is not in the list at all.** In a named profile jobs live in `~/.hermes/profiles/<name>/cron/`.
+Run `hermes -p <name> cron list` and `cron-doctor.py --profile <name>`.
+
+**A run stopped half way with a loop warning.** The unattended loop guardrail ended it after repeated
+identical failing tool calls. Read the run output, fix the failing call or the prompt, then `run` it.
+
 **Many jobs fail with the same error.** One fault, not many: the doctor groups it ("the same error
 failed N jobs in the last 24 h"). Look at the host, the config and the model provider, not at the jobs.
 A known case on systemd installs: since 0.21.3 Hermes starts every cron run outside the gateway through

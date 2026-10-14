@@ -358,6 +358,80 @@ class CronDoctorTests(unittest.TestCase):
         self.assertIn("built-in", findings)
         self.assertNotIn("last run — error", findings)
 
+    # --- named profiles and the tick error marker ------------------------------------------------
+
+    def profile_home(self, name="work"):
+        home = self.home / "profiles" / name
+        (home / "cron").mkdir(parents=True)
+        (home / "cron" / "jobs.json").write_text(json.dumps({"jobs": [job(id=f"{name}-job", name=f"{name} job")]}),
+                                                 encoding="utf-8")
+        now = time.time()
+        (home / "cron" / "ticker_heartbeat").write_text(f"{now} {os.getpid()}", encoding="utf-8")
+        (home / "cron" / "ticker_last_success").write_text(str(now), encoding="utf-8")
+        return home
+
+    def test_profile_reads_its_own_store(self):
+        self.profile_home()
+        result, data = self.payload([job()], "--profile", "Work")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual([item["id"] for item in data["jobs"]], ["work-job"])
+
+    def test_default_profile_is_the_root_home(self):
+        _, data = self.payload([job()], "--profile", "default")
+        self.assertEqual([item["id"] for item in data["jobs"]], ["daily"])
+
+    def test_unknown_or_invalid_profile_is_exit_three(self):
+        self.assertEqual(self.run_doctor([job()], "--profile", "missing").returncode, 3)
+        self.assertEqual(self.run_doctor([job()], "--profile", "../x").returncode, 3)
+
+    def test_profile_is_passed_to_builtin_doctor(self):
+        self.profile_home()
+        launcher, record = self.fake_hermes(0)
+        self.payload([job()], "--profile", "work", environment={"HERMES_BIN": str(launcher)})
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")), ["--profile", "work", "cron", "doctor"])
+
+    def test_profile_resolves_from_root_when_home_is_a_profile(self):
+        """HERMES_HOME may already point at a profile: --profile still means a sibling or the root."""
+        work = self.profile_home("work")
+        self.profile_home("other")
+        env = {"HERMES_HOME": str(work)}
+        _, data = self.payload([job()], "--profile", "other", environment=env)
+        self.assertEqual([item["id"] for item in data["jobs"]], ["other-job"])
+        _, data = self.payload([job()], "--profile", "default", environment=env)
+        self.assertEqual([item["id"] for item in data["jobs"]], ["daily"])
+
+    def stamps(self, success_ago, error_ago=None, error_text="sqlite3.OperationalError: database is locked"):
+        """Fixed stamps with a guaranteed order; the doctor runs with heartbeat=False so none is rewritten."""
+        now = time.time()
+        self.write_jobs([job()])
+        self.stamp("ticker_heartbeat", f"{now} {os.getpid()}")
+        self.stamp("ticker_last_success", str(now - success_ago))
+        if error_ago is not None:
+            self.stamp("ticker_last_error", f"{now - error_ago}\n{error_text}\n")
+
+    def test_failed_last_tick_is_finding(self):
+        self.stamps(success_ago=120, error_ago=60)
+        result, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("the last tick failed (60 s ago)", " ".join(data["findings"]))
+        self.assertIn("database is locked", data["scheduler"]["last_tick_error"])
+
+    def test_tick_error_older_than_last_success_is_ignored(self):
+        self.stamps(success_ago=60, error_ago=600, error_text="old failure")
+        result, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_unreadable_or_empty_tick_error_is_finding(self):
+        self.stamps(success_ago=60)
+        (self.home / "cron" / "ticker_last_error").mkdir()  # cannot be read as a file
+        result, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn("cannot read ticker_last_error", " ".join(data["findings"]))
+        (self.home / "cron" / "ticker_last_error").rmdir()
+        self.stamp("ticker_last_error", f"{time.time()}\n")
+        _, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertIn("holds no message", " ".join(data["findings"]))
+
     def test_missing_cli_falls_back_to_basic_checks(self):
         missing = str(self.home / "no-such-hermes")
         result, data = self.payload([job(last_status="error")], environment={"HERMES_BIN": missing})

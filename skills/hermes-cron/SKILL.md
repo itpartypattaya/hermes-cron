@@ -1,11 +1,11 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.3.0
+version: 1.4.0
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (checked against 0.21.6)
-allowed-tools: cronjob terminal read_file
+compatibility: Hermes Agent >= 0.21 (checked against 0.22.0)
+allowed-tools: cronjob_manage terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---
 
@@ -25,7 +25,9 @@ layers or delivery policies of a particular installation — keep those in a sep
 
 ## Prerequisites
 
-- The `cronjob` tool (Hermes cron toolset) or the `hermes cron` CLI through `terminal`.
+- The `cronjob_manage` tool (old name `cronjob`; the toolset is `cronjob`) or the `hermes cron` CLI
+  through `terminal`. The tool is loaded on demand: if it is not in your tool list, find it with
+  `tool_search` before falling back to the CLI.
 - A running gateway: the scheduler ticks inside it once a minute.
 - Python 3 for the bundled read-only doctor. No network access, no API keys.
 
@@ -38,9 +40,11 @@ python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py"               # all jobs
 python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --job <id>    # one job + recent runs
 python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --json        # machine-readable
 python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --no-builtin  # strictly read-only
+python3 "${HERMES_SKILL_DIR}/scripts/cron-doctor.py" --profile <name>  # a named profile's jobs
 ```
 
-It runs the built-in `hermes cron doctor` and adds what that check does not cover: ticker stamps,
+It runs the built-in `hermes cron doctor` and adds what that check does not cover: ticker stamps and
+the last tick error,
 disabled, malformed and half-paused jobs, failure streaks, the delivery outcome of each job's latest
 completed run, open failure incidents, one error across three or more jobs in the last 24 h, pinned
 models, a cron store that cannot be written or is almost full, and the last failure of a job that has
@@ -59,6 +63,7 @@ entries — `--no-builtin` skips it. Exit codes: `0` healthy, `1` findings (also
 | "Every 30 minutes" | `30m` or `every 30m` | kind `interval`, next run |
 | "Weekdays at 9" | `0 9 * * 1-5` or `weekdays at 9am` | `next_run_at` in the configured `timezone` |
 | "Run it now" | `run` (real run, in the background) | result arrived where expected |
+| "Run it when X happens" | webhook route with `cron_job: <id or name>`; keep a rare schedule as a sweep | the route answers `202`, the run is in history |
 | "Repeat that one-off reminder" | `hermes cron resume <id> --at <ISO>` (one-shots only) | new `next_run_at` |
 | "Delete it" | `remove`, plus any persistent definition | it does not come back after a sync |
 
@@ -111,7 +116,13 @@ cursors (16 KB per value, 64 KB per job) that are injected into the prompt.
   without any tools; it no longer clears the restriction. To return to the default, remove the field.
 - **Monitor output must be stable.** A timestamp in the output makes every tick look changed. The
   first tick always wakes the agent. `monitor` cannot be combined with `no_agent`.
-- **Scripts live in `~/.hermes/scripts/`.** Paths outside it are blocked; `.sh`/`.bash` run in
+- **Unattended runs stop tool loops.** In cron, 5 identical failing calls (or 8 failures of one tool)
+  end the run (`tool_loop_guardrails.non_interactive_hard_stop_enabled`). Fix the call the prompt
+  makes; do not raise the limit to get past a broken tool.
+- **Each profile has its own jobs.** One gateway serves every profile, but jobs, scripts and the
+  heartbeat live in `~/.hermes/profiles/<name>/`; look there (`--profile <name>`), not in `~/.hermes`.
+- **Scripts live in the profile's `scripts/`** — `~/.hermes/scripts/`, or
+  `~/.hermes/profiles/<name>/scripts/` for a named profile. Paths outside it are blocked; `.sh`/`.bash` run in
   bash, everything else in Python; use `--interpreter` for your own venv.
 - **Failures alert once per incident.** Repeats wait `cron.failure_repeat_alert_hours` (6 h);
   `hermes cron incidents ack <id>` silences one. `[CRON_FAILURE]` on the first line of a reply
