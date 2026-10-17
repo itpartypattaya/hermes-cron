@@ -206,7 +206,7 @@ class CronDoctorTests(unittest.TestCase):
         self.assertIn("missing or invalid id", " ".join(data["findings"]))
 
     def test_failed_statuses_checked_without_builtin(self):
-        for status in ("error", "blocked_config", "interrupted"):
+        for status in ("error", "blocked_config"):
             result, data = self.payload([job(last_status=status, last_error="boom")])
             self.assertEqual(result.returncode, 1, status)
             self.assertIn(status, " ".join(data["findings"]))
@@ -216,10 +216,18 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("not delivered", " ".join(data["findings"]))
 
-    def test_held_is_note_not_finding(self):
-        result, data = self.payload([job(last_status="held")])
+    def test_quota_hold_is_note_not_finding(self):
+        """Hermes stores a quota hold as last_status=error plus quota_hold_until, never as "held"."""
+        held = job(last_status="error", last_error="429 usage limit", quota_hold_until=datetime_iso(3600),
+                   next_run_at=datetime_iso(3600))
+        result, data = self.payload([held])
         self.assertEqual(result.returncode, 0, result.stdout)
-        self.assertIn("held", " ".join(data["notes"]))
+        self.assertIn("held until", " ".join(data["notes"]))
+
+    def test_expired_quota_hold_is_a_failure_again(self):
+        result, data = self.payload([job(last_status="error", last_error="429", quota_hold_until=datetime_iso(-3600))])
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("last run", " ".join(data["findings"]))
 
     def test_overdue_uses_fifteen_minute_grace(self):
         self.assertEqual(self.run_doctor([job(next_run_at=datetime_iso(-10 * 60))]).returncode, 0)
@@ -543,6 +551,15 @@ class CronDoctorTests(unittest.TestCase):
             [(name, 120, "Interrupted by shutdown before terminal completion.")
              for name in ("daily", "tick", "backup")]))
         self.assertEqual(self.payload([job()])[1]["shared_failures"], [])
+
+    def test_gateway_shutdown_texts_are_not_a_fault(self):
+        """The exact texts Hermes 0.22.2 writes when a gateway restart interrupts running jobs."""
+        for text in ("Interrupted by gateway shutdown before terminal completion.",
+                     "Interrupted by gateway shutdown before the run finished (tool subprocess was killed mid-flight).",
+                     "Gateway shutdown (drain) killed the job's tool subprocess before the run finished."):
+            self.executions_db(rows=self.failed_runs([(name, 120, text) for name in ("daily", "tick", "backup")]))
+            self.assertEqual(self.payload([job()])[1]["shared_failures"], [], text)
+            (self.home / "cron" / "executions.db").unlink()
 
     def test_executions_without_error_column_is_a_note(self):
         connection = sqlite3.connect(self.home / "cron" / "executions.db")

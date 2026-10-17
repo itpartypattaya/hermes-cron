@@ -157,12 +157,13 @@ are JSON too.
 
 ## Compatibility
 
-Written against Hermes Agent 0.21.5 and checked against 0.21.6 and 0.22.0:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0 and 0.22.2:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
 - jobs follow `cron.model` or the main model at fire time unless pinned;
-- since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set;
+- since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set; a restricted
+  job goes back to the default set through the web dashboard or by recreating it;
 - the agent tool is `cronjob_manage` (old name `cronjob`) and is loaded on demand through `tool_search`;
 - one gateway serves every profile; a named profile's jobs live in `~/.hermes/profiles/<name>/` —
   `--profile <name>` points the doctor there;

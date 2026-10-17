@@ -19,8 +19,9 @@ Do not edit the schedule until you know which layer broke.
 
 **The job did not fire.** Heartbeat first, then `next_run_at`, then `runs`. `state=error` needs
 `last_error` read; do not resume it blindly. `last_status=blocked_config` means preflight found no provider
-key, skill or delivery platform; no LLM call was made and one alert was sent. `last_status=held` means the
-provider reported an exhausted quota and Hermes postponed the run until it recovers — not a bug.
+key, skill or delivery platform; no LLM call was made and one alert was sent. `last_status=error` with a
+future `quota_hold_until` means the provider reported an exhausted quota and Hermes postponed the run until
+it recovers — not a bug.
 
 **No job fires, the heartbeat is fresh.** Check the cron store: on a full disk (`ENOSPC`), a read-only
 mount (`EROFS`) or wrong permissions (`EACCES`) Hermes 0.21.6+ does not run a job whose run it cannot

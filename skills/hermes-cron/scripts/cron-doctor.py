@@ -52,7 +52,7 @@ HEARTBEAT_LIMIT = 180        # the ticker writes a stamp once a minute
 SUCCESS_LIMIT = 600
 FUTURE_SKEW = 300            # a stamp further ahead than this is a clock problem or corruption
 OVERDUE_GRACE = 15 * 60      # same grace as `hermes cron doctor` and `cron status`
-FAILED_STATUSES = {"error", "blocked_config", "interrupted"}
+FAILED_STATUSES = {"error", "blocked_config"}  # a shutdown-interrupted run is stored as "error" too
 BAD_DELIVERY = {"failed", "not_configured"}
 INCIDENT_COLUMNS = {"id", "job_id", "state", "error", "last_seen_at"}
 EXECUTION_COLUMNS = {"job_id", "status", "claimed_at"}
@@ -77,6 +77,8 @@ ERROR_NOISE = (
 # not a broken scheduler (a crash loop shows up in the ticker stamps instead).
 RESTART_ERRORS = (
     "interrupted by shutdown",
+    "interrupted by gateway shutdown",
+    "gateway shutdown (",
     "fire claim ownership lost",
     "scheduler restarted after this execution's owner exited",
 )
@@ -303,11 +305,14 @@ def analyse_job(job, now, builtin_ran, threaded, home=None):
     if active and isinstance(streak, int) and not isinstance(streak, bool) and streak >= 2:
         findings.append(f"{label}: {streak} failed runs in a row")
     status = text(job.get("last_status"))
-    if active and status == "held":
-        notes.append(f"{label}: last_status=held — runs are held until the provider quota recovers")
+    # A quota hold keeps last_status="error" and parks next_run_at; only quota_hold_until marks it.
+    hold = parse_time(job.get("quota_hold_until"))
+    held = active and hold is not None and hold > now
+    if held:
+        notes.append(f"{label}: held until {hold.isoformat()} — the provider usage window is closed")
     if active and not builtin_ran:
         # The built-in doctor makes these checks; here they run only when it did not.
-        if status in FAILED_STATUSES:
+        if status in FAILED_STATUSES and not held:
             findings.append(f"{label}: last run — {status}: {job.get('last_error') or 'no text'}")
         if str(job.get("last_delivery_error") or "").strip():
             findings.append(f"{label}: result not delivered — {job['last_delivery_error']}")

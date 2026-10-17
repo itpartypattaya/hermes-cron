@@ -1,10 +1,10 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.4.1
+version: 1.4.2
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (checked against 0.22.0)
+compatibility: Hermes Agent >= 0.21 (checked against 0.22.2)
 allowed-tools: cronjob_manage terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---
@@ -116,7 +116,9 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   `hermes model` and does not use the global fallback chain; unpinned jobs follow `cron.model`, if set,
   otherwise the main model.
 - **An empty toolset list is a zero-tool job.** Since 0.21.6 `enabled_toolsets: []` keeps the agent
-  without any tools; it no longer clears the restriction. To return to the default, remove the field.
+  without any tools; it no longer clears the restriction. Omitting the field gives the default set
+  only on create; on update it keeps the current list. Neither the tool nor the CLI removes it: clear the
+  toolsets field in the web dashboard's job editor (an empty field saves no restriction) or recreate the job.
 - **Monitor output must be stable.** A timestamp in the output makes every tick look changed. The
   first tick always wakes the agent. `monitor` cannot be combined with `no_agent`.
 - **Unattended runs stop tool loops.** In cron, 5 identical failing calls (or 8 failures of one tool)
@@ -129,7 +131,8 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   bash, everything else in Python; use `--interpreter` for your own venv.
 - **Failures alert once per incident.** Repeats wait `cron.failure_repeat_alert_hours` (6 h);
   `hermes cron incidents ack <id>` silences one. `[CRON_FAILURE]` on the first line of a reply
-  records the run as failed. `last_status=held` is a quota hold, not a bug.
+  records the run as failed. A future `quota_hold_until` next to `last_status=error` is a quota hold,
+  not a bug.
 - **One error in many jobs is one fault.** When the doctor reports the same error across several
   jobs, fix the scheduler or its host first; editing the jobs one by one changes nothing.
   `last_status` and `failure_streak` reset on the next good run; read the run history, or

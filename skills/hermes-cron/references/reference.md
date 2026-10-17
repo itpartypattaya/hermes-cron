@@ -15,7 +15,7 @@ hermes cron pause <id>
 hermes cron resume <id>                   # a paused recurring or one-shot job
 hermes cron resume <id> --at <ISO>        # re-arm a COMPLETED one-shot (one-shots only)
 hermes cron resume <id> --run-now         # same, for now
-hermes cron run <id>                      # a real run on the next tick
+hermes cron run <id>                      # a real run now, waits for the result
 hermes cron runs [<id>] [--limit 20]      # durable attempt history (alias: history)
 hermes cron incidents [--state alerted]   # failure incidents
 hermes cron incidents ack <incident_id>   # silence one error signature
@@ -57,8 +57,10 @@ script path), `no_agent`, `context_from`, `continuity`, `enabled_toolsets`, `wor
 `pinned`; create only: `paused`, `paused_reason`. Clearing on `update`: string fields (`failure_deliver`,
 `monitor`, `workdir`, `script`) take `""`; list fields (`skills`, `context_from`) take `[]`; a blank
 `name` is ignored, not cleared; `continuity: false` turns continuity off. Since 0.21.6
-`enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear;
-omit the field for the default set.
+`enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear.
+Omitting the field means the default set only on create: on update it keeps the stored list, and no
+tool argument or CLI flag removes it. The web dashboard saves an empty toolsets field as no restriction
+(so it cannot set `[]`); otherwise recreate the job.
 `model`, `provider`, `reasoning_effort` and `interpreter` are CLI-only.
 
 ## Schedules
@@ -103,8 +105,8 @@ where the job was created, not automatically the right audience.
 
 `last_status`: `ok`; `error` — the run failed; `delivery_failed` — the run succeeded, delivery did not;
 `delivery_queued` — the reply waits in the delivery queue; `blocked_config` — preflight found no key,
-skill or delivery platform, no LLM call was made; `held` — held until the provider quota recovers;
-`interrupted` — stopped by a gateway shutdown.
+skill or delivery platform, no LLM call was made. A quota hold and a gateway shutdown both store
+`error`: the hold adds `quota_hold_until`, the shutdown says so in `last_error`.
 
 `state`: `scheduled`, `paused`, `completed` (a finished one-shot), `error` (the next run could not be
 computed — read `last_error`).
@@ -140,6 +142,7 @@ error maps to the same incident; a successful run resolves open ones.
 | `output_retention` | `50` | output files kept per job |
 | `script_timeout_seconds` | `3600` | timeout of a `no_agent` script |
 | `failure_repeat_alert_hours` | `6` | when to repeat an alert for the same error; `0` — every time |
+| `retry_unreachable` | `true` | re-run a recurring job that never reached the model (see below) |
 
 Model resolution: job pin → `cron.model` → the main model (`model.default`). A pinned job does not use
 the global `fallback_providers` chain.
@@ -147,9 +150,11 @@ the global `fallback_providers` chain.
 ## Other mechanisms
 
 - **Quota hold.** The provider says "retry after N s" and the whole chain is unavailable → `next_run_at`
-  is parked until the window reopens, `last_status=held`.
+  is parked until the window reopens; `quota_hold_until` holds that time and `last_status` stays `error`.
+  Recurring jobs only; one alert on entering the hold.
 - **Unreachable-model retry.** A network error before the first model call → re-runs after 5, 15 and
-  30 minutes, then the next regular slot.
+  30 minutes, then the next regular slot. Recurring jobs only (a one-shot has spent its run); the failure
+  alert waits while a retry is pending. Off: `cron.retry_unreachable: false`.
 - **Gateway guard.** A job that restarts or stops the gateway is rejected at creation.
 - **Webhook.** A route `platforms.webhook.extra.routes.<name>.cron_job: <id>` fires an existing job per
   event; the event body becomes transient context for that run.
