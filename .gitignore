@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# Working notes kept private: the agent's rules and the hand-over log
+CLAUDE.md
+HANDOFF.md
+plans/
