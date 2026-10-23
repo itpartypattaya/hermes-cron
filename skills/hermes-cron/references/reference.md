@@ -152,7 +152,8 @@ error maps to the same incident; a successful run resolves open ones.
 | `retry_unreachable` | `true` | re-run a recurring job that never reached the model (see below) |
 
 Model resolution: job pin → `cron.model` → the main model (`model.default`) → since 0.22.5, a claimed
-welcome-trial model. A pinned job does not use
+welcome-trial model (`nous/welcome`, only while that trial carries inference; never once a real model
+is configured). A pinned job does not use
 the global `fallback_providers` chain.
 
 ## Other mechanisms
@@ -189,7 +190,9 @@ the global `fallback_providers` chain.
 - **Loop guardrails.** Unattended (cron, gateway) runs hard-stop repeated failing tool calls
   (`tool_loop_guardrails.hard_stop_after`): `exact_failure` 5 — the same call failing the same way,
   `same_tool_failure` 8 — one tool failing with any arguments, `idempotent_no_progress` 5 — the same
-  read-only call repeated without new results. A sequence of different tools is not affected.
+  read-only call repeated without new results. A sequence of different tools is not affected. Since
+  0.22.5 a rate-limited call retried after its cooldown does not count toward `exact_failure`; it still
+  counts toward `same_tool_failure`, so a dead endpoint is still stopped.
 - **Self-removal.** If a run removes its own job with the tool, its final reply is still delivered. From
   a cron session this is possible only with `allow_agent_scheduling: true`.
 

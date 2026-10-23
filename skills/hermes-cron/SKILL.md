@@ -1,10 +1,10 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.5.1
+version: 1.5.2
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (checked against 0.22.4)
+compatibility: Hermes Agent >= 0.21 (checked against 0.22.5)
 allowed-tools: cronjob_manage terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---

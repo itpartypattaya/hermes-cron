@@ -166,7 +166,7 @@ are JSON too.
 
 ## Compatibility
 
-Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2 and 0.22.4:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2, 0.22.4 and 0.22.5:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
