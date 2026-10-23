@@ -609,6 +609,177 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(doctor.store_findings(store, True, None), [])
         self.assertEqual(doctor.store_health(self.home), [])  # a writable temp dir with free space
 
+    # --- Hermes 0.22.4: auto-pause, headless tick, settled deliveries, command-line scripts ------
+
+    # Exact engine texts (v0.22.4 cron/scheduler_authority.py, scheduler_gateway_gate.py,
+    # scheduler_delivery.py); the job name and receipt are made up.
+    AUTO_PAUSES = (
+        "cron admission identity conflict",
+        "Cron execution unverified; reconcile /home/u/.hermes/cron/admissions/ab12.json: "
+        "unknown_execution: cron admission was not replayed",
+        "unknown_execution: cron admission was not replayed",
+        "Canonical cron unknown; no automatic re-execution",
+    )
+    SKIP_ABSENT = ("Skipped: the gateway is not running, so agent jobs cannot fire; they run at the next tick "
+                   "once it is up. Start it with `hermes gateway start` (or `hermes gateway install` for a "
+                   "service).")
+    SKIP_STARTING = ("Skipped: the gateway is starting (control_socket_timeout), so agent jobs cannot fire; they "
+                     "run at the next tick once it is ready. Check it with `hermes gateway status`.")
+    PARKED = ("bot-chat:work queued (receipt 3f2a9c1d7e44): target profile not running; admitted once it is")
+
+    def auto_paused(self, reason, **overrides):
+        return job(enabled=False, state="paused", paused_at="2026-10-22T03:00:00+07:00",
+                   paused_reason=reason, **overrides)
+
+    def test_hermes_auto_pause_is_finding(self):
+        for reason in self.AUTO_PAUSES:
+            result, data = self.payload([self.auto_paused(reason)])
+            findings = " ".join(data["findings"])
+            self.assertEqual(result.returncode, 1, reason)
+            self.assertIn("Hermes paused this job after a fire it could not verify", findings, reason)
+            self.assertIn("hermes cron runs daily", findings, reason)
+
+    def test_auto_paused_past_one_shot_mentions_resume_at(self):
+        once = self.auto_paused(self.AUTO_PAUSES[3], schedule={"kind": "once", "run_at": datetime_iso(-7200)},
+                                next_run_at=None)
+        _, data = self.payload([once])
+        self.assertIn("hermes cron resume daily --at", " ".join(data["findings"]))
+        _, data = self.payload([self.auto_paused(self.AUTO_PAUSES[3])])  # recurring: no one-shot advice
+        self.assertNotIn("--at <ISO>", " ".join(data["findings"]))
+
+    def test_operator_pause_stays_silent(self):
+        """Regression guard: a pause a person set, with any reason or none, is not a finding."""
+        for reason in ("holiday", "", None, 123, ["unknown_execution: x"], "paused after unknown_execution: x"):
+            result, data = self.payload([self.auto_paused(reason)])
+            self.assertEqual(result.returncode, 0, (reason, data["findings"]))
+
+    def skipped(self, job_id, detail, **overrides):
+        fields = {"next_run_at": datetime_iso(-3600), **overrides}
+        return job(id=job_id, name=job_id.title(), last_fire_error={"at": datetime_iso(-60), "detail": detail},
+                   **fields)
+
+    def test_gateway_skip_in_two_jobs_is_one_finding(self):
+        jobs = [self.skipped("a", self.SKIP_ABSENT), self.skipped("b", self.SKIP_STARTING),
+                job(id="watch", name="Watch", no_agent=True, script="w.sh")]
+        (self.home / "scripts").mkdir()
+        (self.home / "scripts" / "w.sh").write_text("true\n", encoding="utf-8")
+        result, data = self.payload(jobs)
+        findings = data["findings"]
+        joined = " ".join(findings)
+        self.assertEqual(result.returncode, 1)
+        grouped = [item for item in findings if "agent jobs were skipped because the gateway was not ready" in item]
+        self.assertEqual(len(grouped), 1, findings)
+        self.assertIn("2 agent jobs", grouped[0])
+        self.assertIn("not running", grouped[0])
+        self.assertIn("starting (control_socket_timeout)", grouped[0])
+        self.assertNotIn("last fire did not dispatch", joined)
+        self.assertNotIn("overdue", joined)
+        self.assertEqual(data["skipped_fires"]["jobs"], ["a", "b"])
+        # With the built-in doctor ours adds the same single finding.
+        launcher, _ = self.fake_hermes(1)
+        _, data = self.payload(jobs, environment={"HERMES_BIN": str(launcher)})
+        self.assertEqual(data["skipped_fires"]["jobs"], ["a", "b"])
+        self.assertEqual(sum("agent jobs were skipped" in item for item in data["findings"]), 1)
+        # --job shows the group instead of a lone overdue job.
+        result, data = self.payload(jobs, "--job", "a")
+        detail = " ".join(data["jobs"][0]["findings"])
+        self.assertIn("agent jobs were skipped because the gateway was not ready", detail)
+        self.assertNotIn("overdue", detail)
+
+    def test_single_or_unrelated_fire_errors_are_not_grouped(self):
+        """Regression guard: one skipped job keeps its own finding; other fire errors never group."""
+        lone = self.skipped("a", self.SKIP_ABSENT, next_run_at="2099-01-01T09:00:00+00:00")
+        result, data = self.payload([lone])
+        self.assertIn("last fire did not dispatch — Skipped: the gateway is not running", " ".join(data["findings"]))
+        self.assertIsNone(data.get("skipped_fires"))
+        other = [self.skipped(name, "worker exited before ack", next_run_at="2099-01-01T09:00:00+00:00")
+                 for name in ("a", "b", "c")]
+        _, data = self.payload(other)
+        self.assertIsNone(data.get("skipped_fires"))
+        self.assertEqual(sum("last fire did not dispatch" in item for item in data["findings"]), 3)
+        duplicate = [lone, dict(lone)]  # one id twice is one job, not two
+        _, data = self.payload(duplicate)
+        self.assertIsNone(data.get("skipped_fires"))
+        for broken in ("Skipped: the gateway is not running", ["x"], {"detail": 5}, {"detail": None}):
+            result, data = self.payload([job(last_fire_error=broken), job(id="b", last_fire_error=broken)])
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertIsNone(data.get("skipped_fires"))
+
+    def queued_run(self, job_id="daily", status="completed", claimed=-7200, finished=-7000, outcome="queued"):
+        claimed_at = claimed if isinstance(claimed, (str, type(None))) else datetime_iso(claimed)
+        finished_at = finished if isinstance(finished, (str, type(None))) else datetime_iso(finished)
+        return ("q-" + status, job_id, status, claimed_at, claimed_at, finished_at, None, outcome)
+
+    def test_stale_queued_delivery_is_note(self):
+        for status in ("completed", "failed", "unknown"):
+            self.executions_db(rows=[self.queued_run(status=status)])
+            result, data = self.payload([job()])
+            self.assertEqual(result.returncode, 0, (status, data["findings"]))
+            self.assertIn("still queued", " ".join(data["notes"]), status)
+            result = self.run_doctor([job()], "--job", "daily")
+            self.assertIn("still queued", result.stdout, status)
+            (self.home / "cron" / "executions.db").unlink()
+
+    def test_fresh_or_unjudgeable_queued_delivery_is_silent(self):
+        """Regression guard: a fresh, long-running, naive, future or broken stamp is never judged stale."""
+        for claimed, finished in ((-120, -60), (-7200, -60), ("2026-01-01T00:00:00", None),
+                                  (3600 * 5, None), ("garbage", "garbage"), (None, None)):
+            self.executions_db(rows=[self.queued_run(claimed=claimed, finished=finished)])
+            result, data = self.payload([job()])
+            self.assertEqual(result.returncode, 0, (claimed, finished, data["findings"]))
+            self.assertNotIn("still queued", " ".join(data["notes"]), (claimed, finished))
+            (self.home / "cron" / "executions.db").unlink()
+
+    def test_command_line_script_hint(self):
+        (self.home / "scripts").mkdir()
+        for script in ("echo hi", "df -h\t/", "a\nb"):
+            _, data = self.payload([job(script=script)])
+            self.assertIn("looks like a command line", " ".join(data["findings"]), repr(script))
+
+    def test_real_scripts_are_not_command_lines(self):
+        """Regression guard: an existing file with a space, a plain missing name, a directory, a path outside."""
+        scripts = self.home / "scripts"
+        scripts.mkdir()
+        (scripts / "my check.sh").write_text("true\n", encoding="utf-8")
+        (scripts / "adir").mkdir()
+        result, data = self.payload([job(script="my check.sh")])
+        self.assertEqual(result.returncode, 0, data["findings"])
+        for script, expected in (("missing.py", "script not found"), ("adir", "not a file"),
+                                 ("../out side.py", "script resolves outside")):
+            _, data = self.payload([job(script=script)])
+            findings = " ".join(data["findings"])
+            self.assertIn(expected, findings, script)
+            self.assertNotIn("command line", findings, script)
+            self.assertNotIn("Path(", findings, script)  # a plain path, never a repr
+
+    def test_parked_bot_chat_delivery_is_note(self):
+        parked = job(deliver="bot-chat:work", last_status="delivery_failed", last_delivery_error=self.PARKED)
+        self.executions_db(rows=[("e1", "daily", "completed", datetime_iso(-600), None, datetime_iso(-590),
+                                  None, "failed")])
+        result, data = self.payload([parked])
+        self.assertEqual(result.returncode, 0, data["findings"])
+        self.assertIn("parked until the target profile's gateway runs", " ".join(data["notes"]))
+        # A real delivery failure next to it is still a finding.
+        _, data = self.payload([dict(parked, last_delivery_error="chat not found")])
+        self.assertIn("not delivered", " ".join(data["findings"]))
+
+    def test_host_store_errors_are_shared_fault(self):
+        """Regression guard: 0.22.4 host errors are real faults, never treated as restarts."""
+        for error in ("Canonical cron session store acquisition timed out",
+                      "Cron admission missing: the owner never admitted this fire"):
+            self.executions_db(rows=self.failed_runs([(name, 300, error) for name in ("daily", "tick", "backup")]))
+            _, data = self.payload([job()])
+            self.assertEqual(len(data["shared_failures"]), 1, error)
+            (self.home / "cron" / "executions.db").unlink()
+
+    def test_new_job_fields_do_not_crash(self):
+        """Regression guard: 0.22.4 bookkeeping fields, well-formed or broken."""
+        for extra in ({"canonical_completions": ["e1", "e2"], "pending_slot": "2026-10-22T09:00:00+07:00",
+                       "last_delivery_queued": {"canonical": {"status": "queued", "execution_id": "e2"}}},
+                      {"canonical_completions": "e1", "pending_slot": 5, "last_delivery_queued": ["x"]}):
+            result, data = self.payload([job(**extra)])
+            self.assertEqual(result.returncode, 0, (extra, data["findings"]))
+
 
 if __name__ == "__main__":
     unittest.main()

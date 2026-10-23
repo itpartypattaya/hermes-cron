@@ -1,10 +1,10 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.4.2
+version: 1.5.0
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (checked against 0.22.2)
+compatibility: Hermes Agent >= 0.21 (checked against 0.22.4)
 allowed-tools: cronjob_manage terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---
@@ -47,9 +47,11 @@ It runs the built-in `hermes cron doctor` and adds what that check does not cove
 the last tick error,
 disabled, malformed and half-paused jobs, failure streaks, the delivery outcome of each job's latest
 completed run, open failure incidents, one error across three or more jobs in the last 24 h, pinned
-models, a cron store that cannot be written or is almost full, and the last failure of a job that has
-recovered since. The doctor never runs, edits or removes a
-job; the built-in check it calls loads `jobs.json` through Hermes, which may repair malformed
+models, a cron store that cannot be written or is almost full, the last failure of a job that has
+recovered since, a pause Hermes set itself after an unverified fire, agent jobs a headless tick
+skipped for want of a ready gateway (reported once), a delivery still `queued` an hour later, a
+bot-chat delivery parked until its target profile runs and a `script` that is a command line. The
+doctor never runs, edits or removes a job; the built-in check it calls loads `jobs.json` through Hermes, which may repair malformed
 entries — `--no-builtin` skips it. Exit codes: `0` healthy, `1` findings (also for `--job`),
 `2` unreadable runtime state, `3` bad arguments or an unknown job.
 
@@ -98,6 +100,7 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
    no tools at all. Leave the model unpinned unless the user asks.
 7. After the change, read the job back and run the doctor with `--job <id>`. For a script job, run
    the script once on its own with safe input; for a watchdog, test both silence and the alert.
+   `hermes cron run <id>` exits with `1` when that run ran in place and failed (0.22.4+).
 8. Report the observed fact: what changed, when it runs next and where the result will go.
 
 ## Pitfalls
@@ -126,6 +129,17 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   makes; do not raise the limit to get past a broken tool.
 - **Each profile has its own jobs.** One gateway serves every profile, but jobs, scripts and the
   heartbeat live in `~/.hermes/profiles/<name>/`; look there (`--profile <name>`), not in `~/.hermes`.
+- **Not every pause is the user's.** Since 0.22.4 Hermes pauses a job itself when it cannot verify a
+  fire (`paused_reason` starts with `Cron execution unverified`, `unknown_execution:`,
+  `Canonical cron unknown` or `cron admission identity conflict`) and may lift that pause once the run
+  is reconciled. Check `hermes cron runs <id>` for an `unknown` run before resuming by hand: the fire
+  may have run already.
+- **`hermes cron tick` needs a ready gateway for agent jobs.** Since 0.22.4 a tick from a system
+  crontab runs only `no_agent` jobs while no gateway is ready; the others get `last_fire_error`
+  `Skipped: the gateway is …`, no run is recorded and the refused slot is not spent. Start the
+  gateway; do not edit the jobs.
+- **`script` is a file, not a command.** Since 0.22.4 a `script` with whitespace that names no file
+  (`echo hi`) is refused on create and update. Put the command into a file under `scripts/`.
 - **Scripts live in the profile's `scripts/`** — `~/.hermes/scripts/`, or
   `~/.hermes/profiles/<name>/scripts/` for a named profile. Paths outside it are blocked; `.sh`/`.bash` run in
   bash, everything else in Python; use `--interpreter` for your own venv.
@@ -133,6 +147,10 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   `hermes cron incidents ack <id>` silences one. `[CRON_FAILURE]` on the first line of a reply
   records the run as failed. A future `quota_hold_until` next to `last_status=error` is a quota hold,
   not a bug.
+- **A parked bot-chat delivery looks like a failure.** When the target profile's gateway is down,
+  Hermes 0.22.4 parks a `bot-chat:<profile>` delivery and hands it over once that gateway runs, but
+  books the run as `delivery_failed` (`target profile not running; admitted once it is`). Start the
+  target profile; do not resend.
 - **One error in many jobs is one fault.** When the doctor reports the same error across several
   jobs, fix the scheduler or its host first; editing the jobs one by one changes nothing.
   `last_status` and `failure_streak` reset on the next good run; read the run history, or

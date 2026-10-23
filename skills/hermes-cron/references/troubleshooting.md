@@ -29,6 +29,20 @@ record. `hermes cron status` leads with "Cron store is NOT writable", `hermes do
 free, and the doctor of this skill reports both. Free space or fix the mount and permissions; no restart
 is needed, and each job that stayed due fires once on the next tick.
 
+**Script jobs fire, agent jobs do not (system crontab, `hermes cron tick`).** Since 0.22.4 a tick outside
+the gateway runs agent jobs only while a gateway is ready; otherwise each one gets `last_fire_error`
+`Skipped: the gateway is not running …` (or `… is starting …`), no run is recorded and the slot is not
+spent. The doctor reports two or more such jobs as one fault. Check `hermes gateway status`, start the
+gateway (`hermes gateway start`, or `hermes gateway install` for a service) and leave the jobs alone; the
+error clears on each job's next successful run.
+
+**A job paused itself.** Since 0.22.4 Hermes pauses a job when it cannot verify that the gateway admitted a
+fire; `paused_reason` starts with `Cron execution unverified`, `unknown_execution:`, `Canonical cron
+unknown` or `cron admission identity conflict`, and the run is `unknown` in `hermes cron runs <id>`. The
+fire may have run already. Hermes may resume the job itself once the run is reconciled; if it stays
+paused, read the run and its output, then resume deliberately. A one-shot past its time needs
+`resume --at`.
+
 **A job lost all its tools.** Since 0.21.6 `enabled_toolsets: []` means "no tools", not "default tools".
 Remove the field, or list the toolsets the job needs.
 
@@ -64,6 +78,15 @@ cron expression.
 **The message arrived twice.** Usually the prompt asked the agent to "send" it and the scheduler delivered
 the reply as well. Remove "send" from the prompt and keep one delivery path; use script-only for fixed text.
 
+**`delivery_queued` or `queued` never clears.** Before 0.22.4 a queued delivery was never written back.
+Since 0.22.4 a drain replaces it with the real outcome, so one that stays for an hour points at the
+gateway or at the run itself (`hermes cron runs <id>`); it does not prove the gateway is down.
+
+**A bot-chat delivery "failed" with `target profile not running; admitted once it is`.** The message is
+parked, not lost: Hermes 0.22.4 hands it over once the target profile's gateway runs, but the run stays
+`delivery_failed`, and the built-in `hermes cron doctor` calls it not delivered. Start the target profile;
+do not resend.
+
 **The message went to the wrong place.** Expand `deliver: origin` into the actual chat/thread. Origin is
 where the job was created, not its audience.
 
@@ -87,6 +110,13 @@ is held.
 
 **A removed or disabled job came back.** There is a persistent writer. Find the configuration source and
 change it together with the runtime; removing the job from `jobs.json` alone is not durable.
+
+**`/cron pause` (or any change) from Desktop or the TUI is refused.** Since 0.22.4 only the gateway that
+owns the cron store changes it; viewers may only read (`/cron`, `/cron list`). Use `hermes cron …` on the
+host or the owning chat.
+
+**`hermes cron create` refuses a script: "not a shell command line".** Since 0.22.4 `script` must name a
+file under the profile's `scripts/`. Write the command into a file there and pass its name.
 
 **An LLM job "resumed" or "removed" other jobs, but nothing changed.** A cron session has no `cronjob`
 toolset (`cron.allow_agent_scheduling: false`): the model answers in text without a tool call. Make such

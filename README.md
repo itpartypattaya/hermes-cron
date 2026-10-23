@@ -114,11 +114,20 @@ skill is installed. The doctor runs the built-in `hermes cron doctor` when the C
 - pinned models and thread-less delivery into chats that use threads;
 - a cron store this user cannot write, or one with less than 100 MB free: Hermes 0.21.6+ skips due
   jobs it cannot record. The check reads permission bits and free space and creates no file;
-- the sticky `last_failure` (0.21.6+) of a job that has recovered since, as a note.
+- the sticky `last_failure` (0.21.6+) of a job that has recovered since, as a note;
+- a pause Hermes 0.22.4+ set itself after a fire it could not verify — resuming it by hand before
+  reading `hermes cron runs <id>` may run the job twice;
+- agent jobs that a headless `hermes cron tick` skipped because no gateway was ready: two or more are
+  one fault (`skipped_fires` in `--json`), and their overdue slots are not reported one by one;
+- a delivery still `queued` an hour after its run (0.22.4+ writes the outcome back once the gateway
+  drains), as a note;
+- a `bot-chat:<profile>` delivery parked until the target profile runs, which Hermes books as
+  `delivery_failed`, as a note instead of "not delivered";
+- a `script` that is a shell command line (`echo hi`), which 0.22.4+ refuses on create and update.
 
 Without the CLI, and always for `--job`, it performs the basic checks itself: failed last run, undelivered
 result, a missing or overdue `next_run_at`, a failed dispatch, a script outside the scripts directory or
-missing, a missing working directory. A built-in doctor that crashes, or a run history that exists but
+missing (with a hint when it is a command line), a missing working directory. A built-in doctor that crashes, or a run history that exists but
 cannot be read, is a finding, not a note. Exit codes: `0` healthy, `1` findings (`--job`
 included), `2` unreadable runtime state, `3` invalid arguments or an unknown job; with `--json`, errors
 are JSON too.
@@ -152,12 +161,12 @@ are JSON too.
   as an argument list without a shell. Hermes' own job loader, like every scheduler tick, may repair
   malformed entries in `jobs.json`.
 - It reads `~/.hermes/cron/jobs.json`, the ticker stamps and `executions.db` (opened read-only). It
-  writes nothing.
+  writes nothing and does not read the gateway's admission journals or parked deliveries.
 - The skill registers no tools, hooks or middleware and needs no environment variables.
 
 ## Compatibility
 
-Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0 and 0.22.2:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2 and 0.22.4:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
@@ -168,7 +177,11 @@ Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0 and 0.22.
 - one gateway serves every profile; a named profile's jobs live in `~/.hermes/profiles/<name>/` —
   `--profile <name>` points the doctor there;
 - a job runs only when `enabled` is true and it carries no pause marker;
-- the ticker heartbeat is `<epoch> <pid>` (older `<epoch>` stamps are still read).
+- the ticker heartbeat is `<epoch> <pid>` (older `<epoch>` stamps are still read);
+- since 0.22.4 agent jobs run through the gateway that owns the store: `hermes cron tick` from a system
+  crontab runs only `no_agent` jobs while no gateway is ready, and a fire Hermes cannot verify pauses
+  the job until it is reconciled;
+- since 0.22.4 `script` must be a file under `scripts/`; a command line is refused.
 
 On an older Hermes, check flags with `hermes cron create --help` before following the examples.
 

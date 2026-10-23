@@ -10,6 +10,12 @@ cannot be written (Hermes 0.21.6+ then skips due jobs) and the sticky `last_fail
 has recovered since. Without the CLI (or with --no-builtin) the basic checks the built-in would have
 made — failed last run, undelivered result, overdue next_run_at — run here.
 
+Hermes 0.22.4 additions: a pause Hermes set itself after a fire it could not verify (resuming it by hand
+may run the job twice), agent jobs that a headless `hermes cron tick` skipped because no gateway was
+ready (two or more are one fault), a delivery still `queued` an hour after its run, a bot-chat delivery
+parked until the target profile runs (Hermes books it as failed), and a `script` that is a shell
+command line.
+
 The same error in three or more jobs within a day is reported once, as one fault of the scheduler or
 its host: per-job fields hide it. `last_status` and `failure_streak` reset on the next good run
 (only `last_failure`, added in 0.21.6, keeps the last failure), and a dispatch failure may not open
@@ -82,6 +88,21 @@ RESTART_ERRORS = (
     "fire claim ownership lost",
     "scheduler restarted after this execution's owner exited",
 )
+# Hermes 0.22.4 pauses a job itself when it cannot verify that a fire was admitted
+# (cron/scheduler_authority.py); a later receipt may lift exactly that pause again.
+AUTO_PAUSE_REASONS = (
+    "cron admission identity conflict",
+    "cron execution unverified",
+    "unknown_execution:",
+    "canonical cron unknown",
+)
+# A headless `hermes cron tick` (0.22.4+) skips agent jobs while no ready gateway serves the home.
+GATEWAY_SKIP = re.compile(r"skipped: the gateway is (.+?), so agent jobs", re.IGNORECASE | re.DOTALL)
+GATEWAY_SKIP_PREFIX = "skipped: the gateway is"
+# A bot-chat delivery whose target profile is down is parked, yet booked as a delivery error (0.22.4).
+PARKED_DELIVERY = "target profile not running; admitted once it is"
+QUEUED_STALE = 3600          # a queued delivery this old was not written back by a drain
+TERMINAL_RUN_STATUSES = ("completed", "failed", "unknown")
 
 
 def hermes_home() -> Path:
@@ -219,6 +240,62 @@ def recovered_failure(job):
     return f"{failure.get('at') or '?'}: {str(failure['detail'])[:160]}"
 
 
+def auto_pause_reason(job):
+    """The `paused_reason` of a pause Hermes 0.22.4+ set itself after an unverified fire, else None."""
+    reason = (text(job.get("paused_reason")) or "").strip()
+    if has_pause_marker(job) and reason.lower().startswith(AUTO_PAUSE_REASONS):
+        return reason
+    return None
+
+
+def past_one_shot(job, now) -> bool:
+    schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+    when = parse_time(schedule.get("run_at")) or parse_time(job.get("next_run_at"))
+    return text(schedule.get("kind")) == "once" and (when is None or when < now)
+
+
+def gateway_skip(job):
+    """The gateway state of a headless-tick skip (0.22.4+) recorded in `last_fire_error`, else None."""
+    fire_error = job.get("last_fire_error")
+    detail = text(fire_error.get("detail")) if isinstance(fire_error, dict) else None
+    if not detail or not detail.strip().lower().startswith(GATEWAY_SKIP_PREFIX):
+        return None
+    match = GATEWAY_SKIP.search(detail)
+    return " ".join((match.group(1) if match else detail.strip()[len(GATEWAY_SKIP_PREFIX):]).split())[:120]
+
+
+def gateway_skips(jobs):
+    """Active agent jobs skipped by a headless tick for want of a ready gateway, when two or more
+    different jobs share that cause; one fault, not N. None otherwise."""
+    states, moments = {}, []
+    for job in jobs:
+        state = gateway_skip(job)
+        if state is None or job.get("no_agent") or job_state(job) != "enabled" or not job_id_of(job):
+            continue
+        states.setdefault(job_id_of(job), state)
+        moment = parse_time(job["last_fire_error"].get("at"))
+        if moment is not None:
+            moments.append(moment)
+    if len(states) < 2:
+        return None
+    return {"jobs": sorted(states), "states": sorted(set(states.values())),
+            "first": min(moments).isoformat() if moments else None,
+            "last": max(moments).isoformat() if moments else None}
+
+
+def skipped_finding(group, names) -> str:
+    listed = ", ".join(f"{job_id} \"{names.get(job_id, '?')}\"" for job_id in group["jobs"][:5])
+    more = f" and {len(group['jobs']) - 5} more" if len(group["jobs"]) > 5 else ""
+    return (f"{len(group['jobs'])} agent jobs were skipped because the gateway was not ready "
+            f"({'; '.join(group['states'])}) — check `hermes gateway status`, not the jobs; each job's "
+            f"recorded refusal clears on its next successful run · jobs: {listed}{more}")
+
+
+def parked_delivery(job) -> bool:
+    """A bot-chat delivery parked until the target profile runs: Hermes books it as a delivery error."""
+    return PARKED_DELIVERY in str(job.get("last_delivery_error") or "")
+
+
 def store_findings(cron_dir: Path, writable: bool, free_bytes):
     """Findings for the cron store. Hermes 0.21.6+ skips a due job whose run it cannot record."""
     if not writable:
@@ -260,24 +337,39 @@ def threaded_chats(jobs):
 
 def script_issue(script, home):
     """Why a job's script cannot run, mirroring the built-in check: it must resolve inside the
-    profile's scripts directory and be an existing file. None when it looks fine or home is unknown."""
+    profile's scripts directory and be an existing file. None when it looks fine or home is unknown.
+
+    A value with whitespace that is no file inside it is a shell command line (`echo hi`): Hermes
+    0.22.4+ refuses it on create and update, so only older jobs carry one. The hint shows wherever this
+    check runs — an active job without the built-in doctor, or --job."""
     if home is None:
         return None
     scripts_dir = (home / "scripts").resolve()
-    raw = Path(script).expanduser()
-    path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
     try:
-        path.relative_to(scripts_dir)
-    except ValueError:
-        return f"script resolves outside {scripts_dir}: {script!r}"
-    if not path.exists():
-        return f"script not found: {path}"
-    if not path.is_file():
-        return f"script path is not a file: {path}"
+        raw = Path(script).expanduser()
+        path = raw.resolve() if raw.is_absolute() else (scripts_dir / raw).resolve()
+    except (OSError, ValueError, RuntimeError):
+        path = None
+    if path is not None:
+        try:
+            path.relative_to(scripts_dir)
+        except ValueError:
+            return f"script resolves outside {scripts_dir}: {script!r}"
+    hint = (" — looks like a command line; Hermes 0.22.4+ refuses these on create and update: put the "
+            "command into a file under scripts/" if any(ch.isspace() for ch in script.strip()) else "")
+    try:
+        exists, is_file = path is not None and path.exists(), path is not None and path.is_file()
+    except (OSError, ValueError):
+        exists = is_file = False
+    if not exists:
+        return f"script not found: {path if path is not None else repr(script)}{hint}"
+    if not is_file:
+        return f"script path is not a file: {path}{hint}"
     return None
 
 
-def analyse_job(job, now, builtin_ran, threaded, home=None):
+def analyse_job(job, now, builtin_ran, threaded, home=None, grouped=frozenset()):
+    """Findings and notes for one job. `grouped`: ids already reported together as gateway skips."""
     findings, notes = [], []
     label = tag(job)
     if not job_id_of(job):
@@ -298,6 +390,17 @@ def analyse_job(job, now, builtin_ran, threaded, home=None):
         findings.append(f"{label}: state=error — {job.get('last_error') or 'no reason recorded'}")
     if job.get("no_agent") and not job.get("script"):
         findings.append(f"{label}: no_agent=true without a script")
+    auto_pause = auto_pause_reason(job)
+    if auto_pause:
+        once = (f" A one-shot past its time stays paused — re-arm it with "
+                f"`hermes cron resume {job_id_of(job) or '<id>'} --at <ISO>`." if past_one_shot(job, now) else "")
+        findings.append(f"{label}: Hermes paused this job after a fire it could not verify ({auto_pause[:160]}); "
+                        f"it may resume automatically once the run is reconciled — before resuming by hand check "
+                        f"`hermes cron runs {job_id_of(job) or '<id>'}` for an `unknown` run, or the job may run "
+                        f"twice.{once}")
+    if parked_delivery(job) and active:
+        notes.append(f"{label}: bot-chat delivery parked until the target profile's gateway runs; the run stays "
+                     "marked delivery_failed even after it is handed over — check the target profile, not the job")
     failure = recovered_failure(job)
     if failure:
         notes.append(f"{label}: last failure at {failure} — recovered since; read the run history")
@@ -314,18 +417,22 @@ def analyse_job(job, now, builtin_ran, threaded, home=None):
         # The built-in doctor makes these checks; here they run only when it did not.
         if status in FAILED_STATUSES and not held:
             findings.append(f"{label}: last run — {status}: {job.get('last_error') or 'no text'}")
-        if str(job.get("last_delivery_error") or "").strip():
+        if str(job.get("last_delivery_error") or "").strip() and not parked_delivery(job):
             findings.append(f"{label}: result not delivered — {job['last_delivery_error']}")
         raw_next = job.get("next_run_at")
         nxt = parse_time(raw_next)
+        # A headless tick that skipped the job leaves its due instant in the past on purpose; the
+        # skip itself is the finding, the overdue slot only its consequence.
+        skipped = gateway_skip(job) is not None and not job.get("no_agent")
         if is_naive(raw_next):
             notes.append(f"{label}: next_run_at has no timezone — overdue check skipped")
         elif nxt is None:
             findings.append(f"{label}: active job has no next_run_at")
-        elif (now - nxt).total_seconds() > OVERDUE_GRACE:
+        elif (now - nxt).total_seconds() > OVERDUE_GRACE and not skipped:
             findings.append(f"{label}: next_run_at is more than 15 minutes overdue")
         fire_error = job.get("last_fire_error")
-        if isinstance(fire_error, dict) and str(fire_error.get("detail") or "").strip():
+        if (job_id_of(job) not in grouped and isinstance(fire_error, dict)
+                and str(fire_error.get("detail") or "").strip()):
             findings.append(f"{label}: last fire did not dispatch — {str(fire_error['detail'])[:160]}")
         script = str(job.get("script") or "").strip()
         problem = script_issue(script, home) if script else None
@@ -349,7 +456,7 @@ def analyse_job(job, now, builtin_ran, threaded, home=None):
     return findings, notes
 
 
-def analyse(jobs, now, builtin_ran, home=None):
+def analyse(jobs, now, builtin_ran, home=None, grouped=frozenset()):
     findings, notes, seen = [], [], set()
     threaded = threaded_chats(jobs)
     for job in jobs:
@@ -357,7 +464,7 @@ def analyse(jobs, now, builtin_ran, home=None):
         if job_id and job_id in seen:
             findings.append(f"{tag(job)}: duplicate id")
         seen.add(job_id)
-        job_findings, job_notes = analyse_job(job, now, builtin_ran, threaded, home)
+        job_findings, job_notes = analyse_job(job, now, builtin_ran, threaded, home, grouped)
         findings += job_findings
         notes += job_notes
     return findings, notes
@@ -379,17 +486,18 @@ def columns(connection, table):
 
 
 def history(home: Path):
-    """Open incidents and each job's latest completed run as (outcome, claimed_at).
+    """Open incidents, each job's latest completed run as (outcome, claimed_at), and each job's latest
+    terminal run whose delivery is still `queued` as {status, claimed_at, finished_at}.
 
-    Returns (incidents, delivery, problems, remarks): problems mean the history could not be read and
-    the check is incomplete; remarks are expected gaps such as an older schema. Each table is read on
-    its own, so a damaged incidents table does not hide delivery failures and vice versa.
+    Returns (incidents, delivery, queued, problems, remarks): problems mean the history could not be
+    read and the check is incomplete; remarks are expected gaps such as an older schema. Each table is
+    read on its own, so a damaged incidents table does not hide delivery failures and vice versa.
     """
     connection, error = connect(home)
     if connection is None:
         missing = not (home / "cron" / "executions.db").exists()
-        return [], {}, ([] if missing else [error]), ([error] if missing else [])
-    incidents, delivery, problems, remarks = [], {}, [], []
+        return [], {}, {}, ([] if missing else [error]), ([error] if missing else [])
+    incidents, delivery, queued, problems, remarks = [], {}, {}, [], []
     try:
         try:
             available = columns(connection, "cron_incidents")
@@ -408,14 +516,21 @@ def history(home: Path):
         try:
             available = columns(connection, "executions")
             if available and EXECUTION_COLUMNS | {"delivery_outcome"} <= available:
-                best = {}
-                for job_id, outcome, claimed, rowid in connection.execute(
-                        "select job_id, delivery_outcome, claimed_at, rowid from executions "
-                        "where status = 'completed'"):
+                # Hermes 0.22.4+ writes a drained delivery's outcome back over `queued`, on a completed,
+                # failed or unknown run alike; only completed runs are judged for a failed delivery.
+                best, latest = {}, {}
+                finished = "finished_at" if "finished_at" in available else "null"
+                for job_id, status, outcome, claimed, finished_at, rowid in connection.execute(
+                        f"select job_id, status, delivery_outcome, claimed_at, {finished}, rowid from executions "
+                        f"where status in ({', '.join('?' * len(TERMINAL_RUN_STATUSES))})", TERMINAL_RUN_STATUSES):
                     key = (instant(claimed), rowid)
-                    if job_id not in best or key > best[job_id][0]:
+                    if status == "completed" and (job_id not in best or key > best[job_id][0]):
                         best[job_id] = (key, outcome, claimed)
+                    if job_id not in latest or key > latest[job_id][0]:
+                        latest[job_id] = (key, {"status": status, "outcome": outcome, "claimed_at": claimed,
+                                                "finished_at": finished_at})
                 delivery = {str(job_id): (outcome, claimed) for job_id, (_, outcome, claimed) in best.items()}
+                queued = {str(job_id): run for job_id, (_, run) in latest.items() if run["outcome"] == "queued"}
             elif available and EXECUTION_COLUMNS <= available:
                 remarks.append("executions has no delivery_outcome column — delivery not checked")
             elif available:
@@ -424,7 +539,20 @@ def history(home: Path):
             problems.append(f"cannot read executions: {exc}")
     finally:
         connection.close()
-    return incidents, delivery, problems, remarks
+    return incidents, delivery, queued, problems, remarks
+
+
+def queued_age(run, now):
+    """Seconds since a queued run finished (or was claimed, when `finished_at` is missing or unreadable);
+    None for a naive or future stamp — those are never judged."""
+    for raw in (run.get("finished_at"), run.get("claimed_at")):
+        if is_naive(raw):
+            return None
+        moment = parse_time(raw)
+        if moment is not None:
+            age = (now - moment).total_seconds()
+            return age if age >= 0 else None
+    return None
 
 
 def error_key(error) -> str:
@@ -510,18 +638,26 @@ def runs(home: Path, job_id: str, limit: int):
     ], None
 
 
-def history_findings(job, incidents, delivery, names):
-    """Findings for one job from the run history: open incidents and an undelivered latest run."""
-    findings, job_id = [], job_id_of(job)
+def history_findings(job, incidents, delivery, queued, names, now):
+    """(findings, notes) for one job from the run history: open incidents, an undelivered latest run
+    and a delivery still queued long after its run ended."""
+    findings, notes, job_id = [], [], job_id_of(job)
     for item in incidents:
         if item["job_id"] == job_id:
             findings.append(f"open incident {item['id']} — {job_id} \"{names.get(job_id, '?')}\": "
                             f"{str(item['error'])[:120]} (silence it: hermes cron incidents ack {item['id']})")
     outcome, claimed = delivery.get(job_id, (None, None))
-    if job_state(job) == "enabled" and outcome in BAD_DELIVERY:
+    # A parked bot-chat delivery is booked as failed; analyse_job already explains it as a note.
+    if job_state(job) == "enabled" and outcome in BAD_DELIVERY and not parked_delivery(job):
         findings.append(f"{tag(job)}: latest completed run ({claimed}) was not delivered "
                         f"(delivery_outcome={outcome})")
-    return findings
+    run = queued.get(job_id)
+    age = queued_age(run, now) if run else None
+    if age is not None and age > QUEUED_STALE:
+        notes.append(f"{tag(job)}: delivery of the latest run ({run['claimed_at']}, {run['status']}) still queued "
+                     f"after {describe_age(age).replace(' ago', '')}; Hermes 0.22.4+ usually writes the outcome back "
+                     f"once the gateway drains — check the gateway and `hermes cron runs {job_id}`")
+    return findings, notes
 
 
 def hermes_binary():
@@ -640,15 +776,21 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
                    or text(job.get("name")) is not None and job["name"].casefold() == token]
         if not matched:
             return {"ok": False, "error": f"job \"{selected}\" not found"}, 3
-        incidents, delivery, problems, remarks = history(home)
+        incidents, delivery, queued, problems, remarks = history(home)
         threaded = threaded_chats(jobs)
+        skipped = gateway_skips(jobs)
+        grouped = frozenset(skipped["jobs"]) if skipped else frozenset()
         details, any_findings = [], bool(problems)
         for job in matched:
             job_id = job_id_of(job)
-            findings, notes = analyse_job(job, now, False, threaded, home)
+            findings, notes = analyse_job(job, now, False, threaded, home, grouped)
+            if job_id in grouped:
+                findings.append(skipped_finding(skipped, names))
             if sum(1 for other in jobs if job_id and job_id_of(other) == job_id) > 1:
                 findings.append(f"{tag(job)}: duplicate id")
-            findings += history_findings(job, incidents, delivery, names)
+            past_findings, past_notes = history_findings(job, incidents, delivery, queued, names, now)
+            findings += past_findings
+            notes += past_notes
             entries, runs_error = runs(home, job_id, limit)
             if runs_error:
                 notes.append(runs_error)
@@ -665,7 +807,11 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
     findings += [shared_finding(group, names) for group in shared] + shared_problems
     notes += shared_remarks
     findings += structure
-    job_findings, job_notes = analyse(jobs, now, builtin["ran"], home)
+    skipped = gateway_skips(jobs)
+    if skipped:
+        findings.append(skipped_finding(skipped, names))
+    job_findings, job_notes = analyse(jobs, now, builtin["ran"], home,
+                                      frozenset(skipped["jobs"]) if skipped else frozenset())
     findings += job_findings
     notes += job_notes
     if builtin["ran"] and builtin["exit_code"] == 1:
@@ -675,9 +821,11 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
                         "install and config; basic checks were done here")
     elif not builtin["ran"]:
         notes.append(f"built-in doctor not run ({builtin['reason']}) — basic checks were done here")
-    incidents, delivery, problems, remarks = history(home)
+    incidents, delivery, queued, problems, remarks = history(home)
     for job in jobs:
-        findings += history_findings(job, incidents, delivery, names)
+        past_findings, past_notes = history_findings(job, incidents, delivery, queued, names, now)
+        findings += past_findings
+        notes += past_notes
     findings += problems
     notes += remarks
     return {
@@ -692,6 +840,7 @@ def report(home: Path, selected: str | None, limit: int, use_builtin: bool, prof
                   "last_failure": job.get("last_failure")} for job in jobs],
         "incidents": incidents,
         "shared_failures": shared,
+        "skipped_fires": skipped,
         "findings": findings,
         "notes": notes,
     }, 1 if findings else 0
