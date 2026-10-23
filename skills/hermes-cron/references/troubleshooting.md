@@ -29,7 +29,7 @@ record. `hermes cron status` leads with "Cron store is NOT writable", `hermes do
 free, and the doctor of this skill reports both. Free space or fix the mount and permissions; no restart
 is needed, and each job that stayed due fires once on the next tick.
 
-**Script jobs fire, agent jobs do not (system crontab, `hermes cron tick`).** Since 0.22.4 a tick outside
+**Script jobs fire, agent jobs do not (an external scheduler runs `hermes cron tick`).** Since 0.22.4 a tick outside
 the gateway runs agent jobs only while a gateway is ready; otherwise each one gets `last_fire_error`
 `Skipped: the gateway is not running …` (or `… is starting …`), no run is recorded and the slot is not
 spent. The doctor reports two or more such jobs as one fault. Check `hermes gateway status`, start the

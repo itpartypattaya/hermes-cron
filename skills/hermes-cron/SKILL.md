@@ -1,7 +1,7 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.5.0
+version: 1.5.1
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
 compatibility: Hermes Agent >= 0.21 (checked against 0.22.4)
@@ -134,8 +134,8 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   `Canonical cron unknown` or `cron admission identity conflict`) and may lift that pause once the run
   is reconciled. Check `hermes cron runs <id>` for an `unknown` run before resuming by hand: the fire
   may have run already.
-- **`hermes cron tick` needs a ready gateway for agent jobs.** Since 0.22.4 a tick from a system
-  crontab runs only `no_agent` jobs while no gateway is ready; the others get `last_fire_error`
+- **`hermes cron tick` needs a ready gateway for agent jobs.** Since 0.22.4 a tick from an external
+  scheduler runs only `no_agent` jobs while no gateway is ready; the others get `last_fire_error`
   `Skipped: the gateway is …`, no run is recorded and the refused slot is not spent. Start the
   gateway; do not edit the jobs.
 - **`script` is a file, not a command.** Since 0.22.4 a `script` with whitespace that names no file

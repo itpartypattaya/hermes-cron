@@ -178,8 +178,8 @@ Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2 a
   `--profile <name>` points the doctor there;
 - a job runs only when `enabled` is true and it carries no pause marker;
 - the ticker heartbeat is `<epoch> <pid>` (older `<epoch>` stamps are still read);
-- since 0.22.4 agent jobs run through the gateway that owns the store: `hermes cron tick` from a system
-  crontab runs only `no_agent` jobs while no gateway is ready, and a fire Hermes cannot verify pauses
+- since 0.22.4 agent jobs run through the gateway that owns the store: `hermes cron tick` from an external
+  scheduler runs only `no_agent` jobs while no gateway is ready, and a fire Hermes cannot verify pauses
   the job until it is reconciled;
 - since 0.22.4 `script` must be a file under `scripts/`; a command line is refused.
 

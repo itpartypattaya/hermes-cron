@@ -165,7 +165,7 @@ the global `fallback_providers` chain.
   alert waits while a retry is pending. Off: `cron.retry_unreachable: false`.
 - **Gateway guard.** A job that restarts or stops the gateway is rejected at creation.
 - **Runs go through the gateway (0.22.4+).** An agent job is admitted and run by the gateway that owns
-  the profile's cron store. A tick outside the gateway (`hermes cron tick` from a system crontab) runs
+  the profile's cron store. A tick outside the gateway (`hermes cron tick` from an external scheduler) runs
   only `no_agent` jobs while no gateway is ready (absent, starting, draining or not answering): the
   others get `last_fire_error` `Skipped: the gateway is <state> …`, no run is recorded and the refused
   slot is not spent. `HERMES_TUI_GATEWAY_URL` skips that readiness check.
