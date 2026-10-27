@@ -476,9 +476,23 @@ def connect(home: Path):
         return None, "executions.db not found"
     try:
         # as_uri() percent-encodes '#', '?', '%' and non-ASCII characters in the path.
-        return sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True), None
-    except (sqlite3.Error, ValueError) as exc:
+        base = database.resolve().as_uri()
+    except ValueError as exc:
         return None, f"cannot open executions.db: {exc}"
+    # Hermes keeps executions.db in WAL mode. SQLite refuses to open a WAL database with
+    # mode=ro while its -shm file is absent, because a read-only connection may not create
+    # it; the open then fails with "unable to open database file" and every delivery and
+    # failure check is skipped. Fall back to immutable=1, which reads the main file and
+    # leaves WAL/SHM alone. sqlite3.connect() opens lazily, so probe with a query.
+    last_error = None
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        try:
+            connection = sqlite3.connect(base + suffix, uri=True, timeout=5)
+            connection.execute("select 1").fetchone()
+            return connection, None
+        except sqlite3.Error as exc:
+            last_error = exc
+    return None, f"cannot read executions.db: {last_error}"
 
 
 def columns(connection, table):
