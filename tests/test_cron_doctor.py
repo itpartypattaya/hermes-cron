@@ -1,3 +1,5 @@
+import contextlib
+import getpass
 import hashlib
 import json
 import os
@@ -108,10 +110,8 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(self.run_doctor([job()], "--runs", "0").returncode, 3)
 
     def test_wal_database_without_shared_memory_is_still_readable(self):
-        """Hermes keeps executions.db in WAL mode. SQLite refuses to open a WAL database with
-        mode=ro while its -shm file is absent, because read-only connections may not create it.
-        The doctor must fall back to a readable mode instead of reporting the history as
-        unreadable, which would hide every delivery and failure check."""
+        """Hermes keeps executions.db in WAL mode; once the last writer exits, -wal and -shm are
+        gone. The doctor must still read the history instead of reporting it as unreadable."""
         self.executions_db(rows=[("e1", "daily", "failed", datetime_iso(-60), None, None,
                                   "boom", "failed")])
         database = self.home / "cron" / "executions.db"
@@ -127,6 +127,74 @@ class CronDoctorTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout)
         unreadable = [finding for finding in data["findings"] if "unable to open" in finding]
         self.assertEqual(unreadable, [], data["findings"])
+
+    @contextlib.contextmanager
+    def no_write_access(self, directory):
+        """No right to create files in directory, as for a doctor run by another user or on a read-only mount."""
+        if os.name == "nt":
+            user = getpass.getuser()
+            subprocess.run(["icacls", str(directory), "/deny", f"{user}:(WD,AD)"], check=True, capture_output=True)
+            try:
+                yield
+            finally:
+                subprocess.run(["icacls", str(directory), "/remove:d", user], check=True, capture_output=True)
+        else:
+            os.chmod(directory, 0o555)
+            try:
+                yield
+            finally:
+                os.chmod(directory, 0o755)
+
+    def wal_history(self, crashed_writer=False):
+        """A WAL-mode executions.db with an undelivered run and an open incident, the writer gone. With
+        crashed_writer, a newer incident was committed to -wal and never checkpointed, and -shm is lost."""
+        self.executions_db(
+            rows=[("e1", "daily", "completed", "2026-09-30T00:00:00+00:00", None, None, None, "failed")],
+            incidents=[("inc1", "daily", "sig", "alerted", "provider 500", "x", "y")])
+        database = self.home / "cron" / "executions.db"
+        connection = sqlite3.connect(database)
+        connection.execute("pragma journal_mode=wal")
+        connection.close()
+        if crashed_writer:
+            writer = ("import os, sqlite3, sys\n"
+                      "connection = sqlite3.connect(sys.argv[1])\n"
+                      "connection.execute('pragma wal_autocheckpoint=0')\n"
+                      "connection.execute(\"insert into cron_incidents values ('inc2', 'daily', 'sig2', 'alerted', "
+                      "'new', 'x', 'y')\")\n"
+                      "connection.commit()\n"
+                      "os._exit(0)\n")
+            subprocess.run([sys.executable, "-I", "-c", writer, str(database)], check=True)
+            database.with_name(database.name + "-shm").unlink()
+        self.write_jobs([job()])
+        now = time.time()
+        self.stamp("ticker_heartbeat", f"{now} {os.getpid()}")
+        self.stamp("ticker_last_success", str(now))
+        return database.parent
+
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "root ignores directory permissions")
+    def test_history_is_read_without_write_access_to_the_store(self):
+        """Without write access to cron/, SQLite cannot create -shm for a WAL database: mode=ro fails, on
+        Linux only at the first read. The doctor must still report delivery failures and incidents, and
+        must not create or change files next to the database."""
+        store = self.wal_history()
+        before = sorted(path.name for path in store.iterdir())
+        with self.no_write_access(store):
+            result, data = self.payload([job()], write=False, heartbeat=False)
+        findings = " ".join(data["findings"])
+        self.assertNotIn("cannot read", findings)
+        self.assertIn("delivery_outcome=failed", findings)
+        self.assertIn("hermes cron incidents ack inc1", findings)
+        self.assertEqual(sorted(path.name for path in store.iterdir()), before)
+
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "root ignores directory permissions")
+    def test_history_read_without_its_wal_says_it_may_lag(self):
+        """Read without write access and without -shm, the rows still in -wal are not seen. The doctor
+        must say that the latest runs may be missing rather than present stale history as complete."""
+        store = self.wal_history(crashed_writer=True)
+        with self.no_write_access(store):
+            result, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertIn("hermes cron incidents ack inc1", " ".join(data["findings"]))
+        self.assertIn("read without its WAL", " ".join(data["notes"]))
 
     def test_invalid_arguments_with_json_print_json(self):
         result = self.run_doctor([job()], "--json", "--runs", "0")

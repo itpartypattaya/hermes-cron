@@ -161,7 +161,9 @@ are JSON too.
   as an argument list without a shell. Hermes' own job loader, like every scheduler tick, may repair
   malformed entries in `jobs.json`.
 - It reads `~/.hermes/cron/jobs.json`, the ticker stamps and `executions.db` (opened read-only). It
-  writes nothing and does not read the gateway's admission journals or parked deliveries.
+  writes nothing and does not read the gateway's admission journals or parked deliveries. Like any
+  SQLite reader of a WAL database it may create the `-shm`/`-wal` files Hermes itself uses; without
+  write access to `cron/` it reads the main file alone and notes when the latest runs may be missing.
 - The skill registers no tools, hooks or middleware and needs no environment variables.
 
 ## Compatibility

@@ -471,28 +471,35 @@ def analyse(jobs, now, builtin_ran, home=None, grouped=frozenset()):
 
 
 def connect(home: Path):
+    """(connection, error, note). note is set when the history was read without its WAL and may lag."""
     database = home / "cron" / "executions.db"
     if not database.exists():
-        return None, "executions.db not found"
+        return None, "executions.db not found", None
     try:
         # as_uri() percent-encodes '#', '?', '%' and non-ASCII characters in the path.
         base = database.resolve().as_uri()
     except ValueError as exc:
-        return None, f"cannot open executions.db: {exc}"
-    # Hermes keeps executions.db in WAL mode. SQLite refuses to open a WAL database with
-    # mode=ro while its -shm file is absent, because a read-only connection may not create
-    # it; the open then fails with "unable to open database file" and every delivery and
-    # failure check is skipped. Fall back to immutable=1, which reads the main file and
-    # leaves WAL/SHM alone. sqlite3.connect() opens lazily, so probe with a query.
+        return None, f"cannot open executions.db: {exc}", None
+    # Hermes keeps executions.db in WAL mode. A mode=ro connection must create the -shm file when it
+    # is absent; without write access to cron/ that fails ("unable to open database file", or "attempt
+    # to write a readonly database" at the first read). immutable=1 reads the main file and leaves
+    # WAL/SHM alone, so rows still in -wal are not seen. sqlite3.connect() opens lazily and "select 1"
+    # never touches the file, so probe with a statement that reads the database header.
     last_error = None
     for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
         try:
             connection = sqlite3.connect(base + suffix, uri=True, timeout=5)
-            connection.execute("select 1").fetchone()
-            return connection, None
+            connection.execute("pragma schema_version").fetchone()
         except sqlite3.Error as exc:
             last_error = exc
-    return None, f"cannot read executions.db: {last_error}"
+            continue
+        note = None
+        wal = database.with_name(database.name + "-wal")
+        if "immutable" in suffix and wal.exists() and wal.stat().st_size:
+            note = (f"executions.db read without its WAL ({wal.stat().st_size} bytes not applied: "
+                    f"no write access to {database.parent}) — the latest runs may be missing")
+        return connection, None, note
+    return None, f"cannot read executions.db: {last_error}", None
 
 
 def columns(connection, table):
@@ -507,11 +514,11 @@ def history(home: Path):
     read and the check is incomplete; remarks are expected gaps such as an older schema. Each table is
     read on its own, so a damaged incidents table does not hide delivery failures and vice versa.
     """
-    connection, error = connect(home)
+    connection, error, note = connect(home)
     if connection is None:
         missing = not (home / "cron" / "executions.db").exists()
         return [], {}, {}, ([] if missing else [error]), ([error] if missing else [])
-    incidents, delivery, queued, problems, remarks = [], {}, {}, [], []
+    incidents, delivery, queued, problems, remarks = [], {}, {}, [], ([note] if note else [])
     try:
         try:
             available = columns(connection, "cron_incidents")
@@ -584,7 +591,7 @@ def shared_failures(home: Path, now: datetime):
     sorted job ids, the number of failed runs and the first and last instant. A missing database is
     left to history(), which already reports it.
     """
-    connection, _ = connect(home)
+    connection, _, _ = connect(home)
     if connection is None:
         return [], [], []
     try:
@@ -629,7 +636,7 @@ def shared_finding(group, names) -> str:
 
 
 def runs(home: Path, job_id: str, limit: int):
-    connection, error = connect(home)
+    connection, error, _ = connect(home)
     if connection is None:
         return [], error
     try:
