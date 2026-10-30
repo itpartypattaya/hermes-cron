@@ -107,6 +107,27 @@ class CronDoctorTests(unittest.TestCase):
     def test_invalid_arguments_are_exit_three(self):
         self.assertEqual(self.run_doctor([job()], "--runs", "0").returncode, 3)
 
+    def test_wal_database_without_shared_memory_is_still_readable(self):
+        """Hermes keeps executions.db in WAL mode. SQLite refuses to open a WAL database with
+        mode=ro while its -shm file is absent, because read-only connections may not create it.
+        The doctor must fall back to a readable mode instead of reporting the history as
+        unreadable, which would hide every delivery and failure check."""
+        self.executions_db(rows=[("e1", "daily", "failed", datetime_iso(-60), None, None,
+                                  "boom", "failed")])
+        database = self.home / "cron" / "executions.db"
+        connection = sqlite3.connect(database)
+        connection.execute("pragma journal_mode=wal")
+        connection.execute("pragma wal_checkpoint(truncate)")
+        connection.close()
+        for suffix in ("-wal", "-shm"):
+            leftover = database.with_name(database.name + suffix)
+            if leftover.exists():
+                leftover.unlink()
+        result, data = self.payload([job()])
+        self.assertEqual(result.returncode, 0, result.stdout)
+        unreadable = [finding for finding in data["findings"] if "unable to open" in finding]
+        self.assertEqual(unreadable, [], data["findings"])
+
     def test_invalid_arguments_with_json_print_json(self):
         result = self.run_doctor([job()], "--json", "--runs", "0")
         self.assertEqual(result.returncode, 3)
