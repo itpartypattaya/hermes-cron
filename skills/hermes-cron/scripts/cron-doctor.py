@@ -470,36 +470,68 @@ def analyse(jobs, now, builtin_ran, home=None, grouped=frozenset()):
     return findings, notes
 
 
+# A mode=ro open of a WAL database fails with these when SQLite may not create the -shm file next to it.
+# Any other error ("database is locked", corruption) is reported as it is, never read around.
+READ_ONLY_OPEN_ERRORS = ("unable to open database file", "attempt to write a readonly database")
+
+
+def open_probed(uri):
+    """sqlite3.connect() opens lazily and "select 1" never touches the file, so probe with a statement
+    that reads the database header; close the connection if the probe fails."""
+    connection = sqlite3.connect(uri, uri=True, timeout=5)
+    try:
+        connection.execute("pragma schema_version").fetchone()
+    except sqlite3.Error:
+        connection.close()
+        raise
+    return connection
+
+
+def unlocked_read_note(database: Path, reason) -> str:
+    wal = database.with_name(database.name + "-wal")
+    try:
+        size = wal.stat().st_size
+    except FileNotFoundError:
+        size = 0
+    except OSError:
+        size = None
+    if size is None:
+        detail = "; -wal could not be checked"
+    elif size:
+        detail = f"; -wal ({size} bytes) was not read"
+    else:
+        detail = ""
+    return (f"executions.db read without locks ({reason}){detail} — the latest runs may be missing, "
+            "and a write by Hermes during the check is not seen consistently")
+
+
 def connect(home: Path):
-    """(connection, error, note). note is set when the history was read without its WAL and may lag."""
+    """(connection, error, note). note is set when the history was read without locks and may lag."""
     database = home / "cron" / "executions.db"
     if not database.exists():
         return None, "executions.db not found", None
     try:
+        # SQLite opens the symlink target; its -wal and -shm lie next to it.
+        database = database.resolve()
         # as_uri() percent-encodes '#', '?', '%' and non-ASCII characters in the path.
-        base = database.resolve().as_uri()
-    except ValueError as exc:
+        base = database.as_uri()
+    except (OSError, ValueError) as exc:
         return None, f"cannot open executions.db: {exc}", None
-    # Hermes keeps executions.db in WAL mode. A mode=ro connection must create the -shm file when it
-    # is absent; without write access to cron/ that fails ("unable to open database file", or "attempt
-    # to write a readonly database" at the first read). immutable=1 reads the main file and leaves
-    # WAL/SHM alone, so rows still in -wal are not seen. sqlite3.connect() opens lazily and "select 1"
-    # never touches the file, so probe with a statement that reads the database header.
-    last_error = None
-    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
-        try:
-            connection = sqlite3.connect(base + suffix, uri=True, timeout=5)
-            connection.execute("pragma schema_version").fetchone()
-        except sqlite3.Error as exc:
-            last_error = exc
-            continue
-        note = None
-        wal = database.with_name(database.name + "-wal")
-        if "immutable" in suffix and wal.exists() and wal.stat().st_size:
-            note = (f"executions.db read without its WAL ({wal.stat().st_size} bytes not applied: "
-                    f"no write access to {database.parent}) — the latest runs may be missing")
-        return connection, None, note
-    return None, f"cannot read executions.db: {last_error}", None
+    try:
+        return open_probed(base + "?mode=ro"), None, None
+    except sqlite3.Error as exc:
+        error = exc
+    # Hermes keeps executions.db in WAL mode. Without write access to its directory, mode=ro cannot
+    # create the missing -shm ("unable to open database file", or "attempt to write a readonly
+    # database" at the first read on Linux). immutable=1 reads the main file without locks and leaves
+    # WAL/SHM alone: rows still in -wal are not seen, and a concurrent write can be seen half-done.
+    if not any(text in str(error) for text in READ_ONLY_OPEN_ERRORS):
+        return None, f"cannot read executions.db: {error}", None
+    try:
+        connection = open_probed(base + "?mode=ro&immutable=1")
+    except sqlite3.Error as exc:
+        return None, f"cannot read executions.db: {error}; without locks: {exc}", None
+    return connection, None, unlocked_read_note(database, f"read-only open failed: {error}")
 
 
 def columns(connection, table):

@@ -163,7 +163,8 @@ are JSON too.
 - It reads `~/.hermes/cron/jobs.json`, the ticker stamps and `executions.db` (opened read-only). It
   writes nothing and does not read the gateway's admission journals or parked deliveries. Like any
   SQLite reader of a WAL database it may create the `-shm`/`-wal` files Hermes itself uses; without
-  write access to `cron/` it reads the main file alone and notes when the latest runs may be missing.
+  write access to `cron/` it reads the main file without locks and says so in its notes. A database
+  that is locked by a writer is reported as unreadable, not read around.
 - The skill registers no tools, hooks or middleware and needs no environment variables.
 
 ## Compatibility

@@ -185,6 +185,8 @@ class CronDoctorTests(unittest.TestCase):
         self.assertIn("delivery_outcome=failed", findings)
         self.assertIn("hermes cron incidents ack inc1", findings)
         self.assertEqual(sorted(path.name for path in store.iterdir()), before)
+        # Read without locks, a write by Hermes during the check is not seen consistently: say so.
+        self.assertIn("read without locks", " ".join(data["notes"]))
 
     @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "root ignores directory permissions")
     def test_history_read_without_its_wal_says_it_may_lag(self):
@@ -194,7 +196,50 @@ class CronDoctorTests(unittest.TestCase):
         with self.no_write_access(store):
             result, data = self.payload([job()], write=False, heartbeat=False)
         self.assertIn("hermes cron incidents ack inc1", " ".join(data["findings"]))
-        self.assertIn("read without its WAL", " ".join(data["notes"]))
+        notes = " ".join(data["notes"])
+        self.assertIn("read without locks", notes)
+        self.assertIn("-wal (", notes)
+
+    @unittest.skipIf(getattr(os, "geteuid", lambda: 1)() == 0, "root ignores directory permissions")
+    def test_leftover_wal_is_found_next_to_a_symlinked_store(self):
+        """executions.db may be a symlink (a profile or a store moved to another disk). SQLite opens the
+        target, so the leftover -wal that is not read lies next to the target, not next to the link."""
+        store = self.wal_history(crashed_writer=True)
+        target = self.home / "elsewhere"
+        target.mkdir()
+        for name in ("executions.db", "executions.db-wal"):
+            (store / name).rename(target / name)
+        try:
+            os.symlink(target / "executions.db", store / "executions.db")
+        except (OSError, NotImplementedError) as exc:
+            self.skipTest(f"cannot create a symlink here: {exc}")
+        with self.no_write_access(target):
+            result, data = self.payload([job()], write=False, heartbeat=False)
+        self.assertIn("hermes cron incidents ack inc1", " ".join(data["findings"]))
+        self.assertIn("-wal (", " ".join(data["notes"]))
+
+    def test_busy_store_is_not_read_without_locks(self):
+        """While a writer holds the database locked, mode=ro fails with "database is locked". That is not
+        a missing -shm: reading without locks then may mix two states of a file being written. The doctor
+        must report that it cannot read the history, as before the immutable fallback existed."""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("cron_doctor", SCRIPT)
+        doctor = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(doctor)
+        store = self.wal_history()
+        writer = sqlite3.connect(store / "executions.db", isolation_level=None)
+        try:
+            writer.execute("pragma locking_mode=exclusive")
+            writer.execute("begin exclusive")
+            writer.execute("insert into cron_incidents values ('inc2', 'daily', 'sig2', 'alerted', 'new', 'x', 'y')")
+            connection, error, note = doctor.connect(self.home)
+            if connection is not None:
+                connection.close()
+            self.assertIsNone(connection, note)
+            self.assertIn("database is locked", error)
+        finally:
+            writer.execute("rollback")
+            writer.close()
 
     def test_invalid_arguments_with_json_print_json(self):
         result = self.run_doctor([job()], "--json", "--runs", "0")
