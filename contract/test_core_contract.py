@@ -101,9 +101,11 @@ class HealthyStore(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.home, ignore_errors=True)
 
-    def test_store_is_the_format_the_doctor_reads(self):
+    def test_store_journal_mode_is_one_the_doctor_reads(self):
+        # Hermes creates a new database in WAL, except with an SQLite that has the WAL-reset bug (before 3.51.3,
+        # as on the Linux CI runner): then in DELETE. A database that is already WAL stays WAL either way.
         with sqlite3.connect(self.home / "cron" / "executions.db") as connection:
-            self.assertEqual(connection.execute("pragma journal_mode").fetchone()[0], "wal")
+            self.assertIn(connection.execute("pragma journal_mode").fetchone()[0], ("wal", "delete"))
 
     def test_no_findings_and_everything_read(self):
         code, data = doctor(self.home)
@@ -209,12 +211,18 @@ class HistoryStillInWal(unittest.TestCase):
         job_id = create(home, "report", "hello.py")
         core(home, "cron", "run", job_id)  # creates the database
         database = home / "cron" / "executions.db"
+        # A store that is WAL already (made by an SQLite without the WAL-reset bug, as in production): Hermes
+        # never switches it back, whatever SQLite it runs on now.
+        with sqlite3.connect(database) as connection:
+            self.assertEqual(connection.execute("pragma journal_mode=wal").fetchone()[0], "wal")
+        connection.close()
         holder = sqlite3.connect(database)  # another open connection: the core's close does not checkpoint
         self.addCleanup(holder.close)
         holder.execute("select count(*) from executions").fetchone()
         core(home, "cron", "run", job_id)
         wal = database.with_name(database.name + "-wal")
         self.assertGreater(wal.stat().st_size if wal.exists() else 0, 0, "the second run is not in -wal")
+        self.assertEqual(holder.execute("pragma journal_mode").fetchone()[0], "wal", "Hermes switched WAL off")
         code, data = doctor(home, "--job", job_id)
         self.assertEqual(code, 0, data)
         self.assertEqual((data["history_problems"], data["history_notes"]), ([], []))
