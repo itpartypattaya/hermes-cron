@@ -11,7 +11,8 @@ permissions:
 
 jobs:
   unittest:
-    runs-on: ubuntu-latest
+    # 24.04: ubuntu-latest moved to 26.04, which has no Python 3.9 build, and the doctor promises 3.9
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -23,3 +24,42 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Run tests (stdlib unittest, no network)
         run: python -m unittest discover -s tests -v
+
+  # The doctor reads what Hermes core writes (cron/jobs.json, executions.db in WAL, ticker stamps), while the
+  # unit tests above build those files by hand. Here the latest core release writes them with its own code
+  # (`hermes cron create / pause / run`, no-agent script jobs: no network, no model keys) and the doctor must
+  # read all of it: a format change in core turns this job red instead of leaving the doctor blind.
+  core-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: plugin
+      - name: Pick the core ref (latest release, what users run)
+        id: core
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ref=$(gh release view --repo NousResearch/hermes-agent --json tagName --jq .tagName)
+          echo "core ref: $ref"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          path: hermes-agent
+          ref: ${{ steps.core.outputs.ref }}
+      # Hermes core gates every runtime dependency on python_version >= '3.14'; older Pythons install none of them.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      # Through uv with core's own [tool.uv] override-dependencies: plain pip cannot resolve core's pins.
+      - name: Install hermes-agent
+        run: |
+          python -m pip install "uv==0.13.3"
+          python -c "import tomllib; print('\n'.join(tomllib.load(open('hermes-agent/pyproject.toml', 'rb')).get('tool', {}).get('uv', {}).get('override-dependencies', [])))" > hermes-overrides.txt
+          python -m uv pip install --system --overrides hermes-overrides.txt -e ./hermes-agent
+          command -v hermes
+      - name: Run the doctor on a store the core wrote
+        working-directory: plugin
+        run: python -m unittest discover -s contract -v
