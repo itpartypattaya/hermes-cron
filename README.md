@@ -204,6 +204,7 @@ skills/hermes-cron/
   references/reference.md
   references/troubleshooting.md
 tests/test_cron_doctor.py        # stdlib unittest, no network
+contract/test_core_contract.py   # the doctor on a store real Hermes core wrote
 docs/                            # images used by this README
 ```
 
@@ -211,6 +212,14 @@ docs/                            # images used by this README
 
 ```bash
 python3 -m unittest discover -s tests -v
+```
+
+The unit tests build `jobs.json` and `executions.db` by hand. CI also runs `contract/` against the latest Hermes
+release: the core itself creates, pauses and runs no-agent jobs, and the doctor must read that store with no
+false findings and with every planted fault found. Locally it needs Hermes core installed in the same Python:
+
+```bash
+python3 -m unittest discover -s contract -v
 ```
 
 Issues and pull requests are welcome.
