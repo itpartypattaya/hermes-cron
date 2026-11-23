@@ -1,10 +1,10 @@
 ---
 name: hermes-cron
 description: Create, change, pause and debug Hermes cron jobs.
-version: 1.5.4
+version: 1.5.5
 author: "Anton Vaskov (itpartypattaya), https://t.me/passone"
 license: MIT
-compatibility: Hermes Agent >= 0.21 (checked against 0.22.5)
+compatibility: Hermes Agent >= 0.21 (checked against 0.23.3)
 allowed-tools: cronjob_manage terminal read_file
 tags: [cron, scheduler, reminders, watchdogs, ops]
 ---
@@ -110,7 +110,12 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
 - **Half-pause.** A job runs only if `enabled=true` and it has no pause marker (`state=paused` or
   `paused_at`). `enabled=true` plus a marker never fires, yet `cron list` shows it as scheduled.
 - **Missed slots.** A slot missed while paused fires once after `resume` (or is skipped by
-  `cron.catch_up_missed: false`); a gateway restart can also trigger one catch-up run.
+  `cron.catch_up_missed: false`); a gateway restart can also trigger one catch-up run. Since 0.22.6 a
+  job's own `catch_up` (`--catch-up on|off`) and `grace_minutes` override the global setting, and
+  skipped slots show as a `missed` row in `hermes cron runs <id>`.
+- **`cron run` in `hermes console` resumes the job.** In 0.23.3 the console's `cron run <id>` clears
+  the pause (`enabled`, `state`, `paused_reason`) before it runs, while `hermes cron run`, `/cron run`
+  and the tool refuse a paused job. Use `hermes cron run` and resume deliberately.
 - **No date-based resume for recurring jobs.** `resume --at` and `--run-now` re-arm one-shots only.
 - **Cron sessions cannot schedule.** The `cronjob` toolset is off inside cron runs
   (`cron.allow_agent_scheduling: false`); `messaging` and `clarify` are always off. A cron run that
@@ -120,10 +125,14 @@ saves nothing) that are injected into the prompt. There is no notepad tool: a ru
   otherwise the main model.
 - **An empty toolset list is a zero-tool job.** Since 0.21.6 `enabled_toolsets: []` keeps the agent
   without any tools; it no longer clears the restriction. Omitting the field gives the default set
-  only on create; on update it keeps the current list. Neither the tool nor the CLI removes it: clear the
-  toolsets field in the web dashboard's job editor (an empty field saves no restriction) or recreate the job.
+  only on create; on update it keeps the current list. Neither the tool nor the CLI removes it, and since
+  0.23.2 the web dashboard keeps a stored `[]` too (it still clears a non-empty list): recreate the job.
 - **Monitor output must be stable.** A timestamp in the output makes every tick look changed. The
-  first tick always wakes the agent. `monitor` cannot be combined with `no_agent`.
+  first tick always wakes the agent. `monitor` cannot be combined with `no_agent`. Since 0.23.2 a
+  monitor URL on a private or internal address fails unless `security.allow_private_urls: true`.
+- **A job that worked can be blocked after an upgrade.** The prompt is scanned again at every fire; in
+  0.23.3 a `curl` that sends a secret variable is refused for every host, GitHub included. Use
+  `gh api` or move the call into a `--script`.
 - **Unattended runs stop tool loops.** In cron, 5 identical failing calls (or 8 failures of one tool)
   end the run (`tool_loop_guardrails.non_interactive_hard_stop_enabled`). Fix the call the prompt
   makes; do not raise the limit to get past a broken tool.

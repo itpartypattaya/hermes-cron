@@ -169,13 +169,13 @@ are JSON too.
 
 ## Compatibility
 
-Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2, 0.22.4 and 0.22.5:
+Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2, 0.22.4, 0.22.5 and 0.23.3:
 
 - `in 30m` is one-shot; `30m` and `every 30m` repeat; `every monday 9am` and `weekdays at 9am` become
   cron expressions;
 - jobs follow `cron.model` or the main model at fire time unless pinned;
-- since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set; a restricted
-  job goes back to the default set through the web dashboard or by recreating it;
+- since 0.21.6, `enabled_toolsets: []` means a job with no tools, not the default set; such a job goes
+  back to the default set only by recreating it (since 0.23.2 the web dashboard keeps a stored `[]`);
 - the agent tool is `cronjob_manage` (old name `cronjob`) and is loaded on demand through `tool_search`;
 - one gateway serves every profile; a named profile's jobs live in `~/.hermes/profiles/<name>/` —
   `--profile <name>` points the doctor there;
@@ -184,7 +184,13 @@ Written against Hermes Agent 0.21.5 and checked against 0.21.6, 0.22.0, 0.22.2, 
 - since 0.22.4 agent jobs run through the gateway that owns the store: `hermes cron tick` from an external
   scheduler runs only `no_agent` jobs while no gateway is ready, and a fire Hermes cannot verify pauses
   the job until it is reconciled;
-- since 0.22.4 `script` must be a file under `scripts/`; a command line is refused.
+- since 0.22.4 `script` must be a file under `scripts/`; a command line is refused;
+- since 0.22.6 a manual run is an extra fire (it spends neither the next slot nor a `repeat` count),
+  `hermes cron cancel` stops a live run, a job can carry its own `timezone`, `catch_up` and
+  `grace_minutes`, and skipped slots are booked as `missed` runs, which the doctor does not count as
+  failures;
+- since 0.23.2 error text in `jobs.json` and `executions.db` is redacted and cut to 2000 characters, so
+  the doctor shows it that way.
 
 On an older Hermes, check flags with `hermes cron create --help` before following the examples.
 

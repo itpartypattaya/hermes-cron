@@ -17,7 +17,8 @@ Do not edit the schedule until you know which layer broke.
 
 ## Symptoms
 
-**The job did not fire.** Heartbeat first, then `next_run_at`, then `runs`. `state=error` needs
+**The job did not fire.** Heartbeat first, then `next_run_at`, then `runs`: since 0.22.6 a `missed ×N` row
+there means the scheduler skipped those slots (downtime past the catch-up window). `state=error` needs
 `last_error` read; do not resume it blindly. `last_status=blocked_config` means preflight found no provider
 key, skill or delivery platform; no LLM call was made and one alert was sent. `last_status=error` with a
 future `quota_hold_until` means the provider reported an exhausted quota and Hermes postponed the run until
@@ -44,7 +45,8 @@ paused, read the run and its output, then resume deliberately. A one-shot past i
 `resume --at`.
 
 **A job lost all its tools.** Since 0.21.6 `enabled_toolsets: []` means "no tools", not "default tools".
-Remove the field, or list the toolsets the job needs.
+List the toolsets the job needs with `update`; no tool argument, CLI flag or (since 0.23.2) dashboard save
+removes a stored `[]`, so to get the default set back, recreate the job.
 
 **The tick runs but fails.** `hermes cron status` and the doctor show the last tick error from
 `ticker_last_error` (a locked database, a broken `jobs.json`, a full disk). Fix that error; the file
@@ -70,8 +72,9 @@ reset on the next good run, a daily job that missed three nights can look health
 run history (`cron-doctor.py --job <id>`, `hermes cron runs <id>`), `last_failure` (0.21.6+) and the
 gateway log.
 
-**The job fired at the wrong time.** A catch-up after a gateway restart (`cron.catch_up_missed`) or after
-`resume`: a slot missed while paused fires once. A re-run 5, 15 or 30 minutes after a network error is the
+**The job fired at the wrong time.** A catch-up after a gateway restart (`cron.catch_up_missed`, or since
+0.22.6 the job's own `catch_up` and `grace_minutes`) or after `resume`: a slot missed while paused fires
+once. A job with its own `timezone` (0.22.6+) reads its schedule in that zone, not the profile's. A re-run 5, 15 or 30 minutes after a network error is the
 built-in retry for an unreachable model. Compare the run time with restarts and `resume`, not only with the
 cron expression.
 

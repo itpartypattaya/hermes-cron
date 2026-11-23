@@ -1,6 +1,6 @@
 # Hermes Cron Reference
 
-Upstream Hermes Agent 0.22.4 behaviour (written against 0.21.5, checked at every release since). Local GitOps layers, chat routing and extra fields belong in a
+Upstream Hermes Agent 0.23.3 behaviour (written against 0.21.5, checked at every release since). Local GitOps layers, chat routing and extra fields belong in a
 separate profile skill, not here. On another version, check flags with `hermes cron <command> --help`.
 
 ## CLI
@@ -15,7 +15,9 @@ hermes cron pause <id>
 hermes cron resume <id>                   # a paused recurring or one-shot job
 hermes cron resume <id> --at <ISO>        # re-arm a COMPLETED one-shot (one-shots only)
 hermes cron resume <id> --run-now         # same, for now
-hermes cron run <id>                      # a real run now, waits for the result; exit 1 if it ran in place and failed (0.22.4+)
+hermes cron run <id>                      # a real run now, waits for the result; exit 1 if it ran in place and failed (0.22.4+);
+                                          # an extra fire: the next slot and the repeat count stay (0.22.6+)
+hermes cron cancel <id> [--reason ...]    # stop a live run; the schedule stays (0.22.6+)
 hermes cron runs [<id>] [--limit 20]      # durable attempt history (alias: history)
 hermes cron incidents [--state alerted]   # failure incidents
 hermes cron incidents ack <incident_id>   # silence one error signature
@@ -30,13 +32,13 @@ hermes cron tick                          # run due jobs once and exit — not a
 | Flag | Meaning |
 | --- | --- |
 | `--name` | human-readable name |
-| `--deliver` | `origin`, `local`, a platform, `platform:chat_id[:thread_id]`, `bot-chat[:profile]` |
+| `--deliver` | `origin`, `local`, `all`, a platform, `platform:chat_id[:thread_id]`, `bot-chat[:profile]`, `room:<room_id>[@profile]` (a Group Chat; wakes only the bots it @mentions, 0.22.7+); several separated by commas |
 | `--failure-deliver` | target for failure notices only; `local` suppresses them |
 | `--repeat N` | repeat limit |
 | `--skill` | attach a skill (repeatable); `edit` also has `--add-skill`, `--remove-skill`, `--clear-skills` |
 | `--script` | a file in `~/.hermes/scripts/`: a pre-check, or the job itself with `--no-agent`; a value with whitespace that names no file (`echo hi`) is refused (0.22.4+) |
 | `--no-agent` | no LLM: script stdout is delivered verbatim; `edit` reverses it with `--agent` |
-| `--monitor-script` / `--monitor-url` | change detector; mutually exclusive, incompatible with `--no-agent` |
+| `--monitor-script` / `--monitor-url` | change detector; mutually exclusive, incompatible with `--no-agent`; since 0.23.2 a URL on a private or internal address is blocked unless `security.allow_private_urls: true` |
 | `--continuity` | each run sees its own previous output; `edit` has `--no-continuity` |
 | `--workdir` | working directory: its project context files join the prompt, cwd for tools |
 | `--model`, `--provider` | pin a model (the agent's tool cannot set this) |
@@ -44,25 +46,30 @@ hermes cron tick                          # run due jobs once and exit — not a
 | `--reasoning-effort` | `none` … `ultra` per job |
 | `--interpreter` | Python from your own venv for a `.py` script |
 | `--paused`, `--paused-reason` | create disabled in one write, with a reason |
+| `--timezone` | IANA zone for this job's wall clock instead of the profile's (0.22.6+) |
+| `--catch-up on\|off` | missed runs: `on` runs once on return, `off` skips them; overrides `cron.catch_up_missed` (0.22.6+) |
+| `--grace-minutes` | catch-up window, 0–1440, for a cron schedule; `0` never runs a miss late (0.22.6+) |
+| `--wrap-response` / `--no-wrap-response` | header and footer around this job's output, overriding `cron.wrap_response`; `edit` also has `--inherit-wrap-response` (0.23.2+) |
 
 ## The `cronjob_manage` tool
 
 The old name `cronjob` still works; the toolset is called `cronjob`. Hermes loads this tool on demand
 (`tools.tool_search.defer`): when it is missing from the tool list, call `tool_search` for it first.
 
-Actions: `create`, `list`, `update`, `pause`, `resume`, `remove`, `run`. Call `list` before
-`update`/`pause`/`resume`/`remove`/`run`; never guess ids. `run` happens in the background and returns a
+Actions: `create`, `list`, `update`, `pause`, `resume`, `remove`, `run`, `cancel` (stops a live run, the
+schedule stays). Call `list` before `update`/`pause`/`resume`/`remove`/`run`/`cancel`; never guess ids. `run` happens in the background and returns a
 handle; `prompt` with `run` is transient context for that fire only. Fields for `create`/`update`:
 `prompt`, `schedule`, `name`, `repeat`, `deliver`, `failure_deliver`, `skills`, `script`, `monitor` (URL or
 script path), `no_agent`, `context_from`, `continuity`, `enabled_toolsets`, `workdir`, `attach_to_session`,
-`pinned`; create only: `paused`, `paused_reason`. Clearing on `update`: string fields (`failure_deliver`,
+`pinned`, `timezone`, `catch_up`, `wrap_response` (`on`/`off`/`inherit`); create only: `paused`, `paused_reason`. Clearing on `update`: string fields (`failure_deliver`,
 `monitor`, `workdir`, `script`) take `""`; list fields (`skills`, `context_from`) take `[]`; a blank
 `name` is ignored, not cleared; `continuity: false` turns continuity off. Since 0.21.6
 `enabled_toolsets: []` is an explicit zero-tool allowlist (MCP servers included), not a clear.
 Omitting the field means the default set only on create: on update it keeps the stored list, and no
 tool argument or CLI flag removes it. The web dashboard saves an empty toolsets field as no restriction
-(so it cannot set `[]`); otherwise recreate the job.
-`model`, `provider`, `reasoning_effort` and `interpreter` are CLI-only.
+(so it cannot set `[]`) and clears a non-empty list, but since 0.23.2 it leaves a stored `[]` as it is;
+then recreate the job.
+`model`, `provider`, `reasoning_effort`, `interpreter` and `grace_minutes` are CLI-only.
 
 ## Schedules
 
@@ -74,7 +81,8 @@ tool argument or CLI flag removes it. The web dashboard saves an empty toolsets 
 | Cron expression | `0 9 * * 1-5`; `MON-FRI`, `JAN-DEC` allowed | `cron` |
 | Once, at an exact time | `2026-10-01T09:00:00+07:00` | `once` |
 
-Times without a zone and cron expressions use `timezone` from `config.yaml`. A one-shot more than a couple
+Times without a zone and cron expressions use the job's own `timezone` (0.22.6+), otherwise `timezone`
+from `config.yaml`. A one-shot more than a couple
 of minutes in the past is rejected. After creating a job, compare the computed `next_run_at` with the
 expected time.
 
@@ -108,14 +116,17 @@ where the job was created, not automatically the right audience.
 `last_status`: `ok`; `error` — the run failed; `delivery_failed` — the run succeeded, delivery did not;
 `delivery_queued` — the reply waits in the delivery queue (0.22.4+ usually turns it into `ok` or
 `delivery_failed` once the gateway drains it); `blocked_config` — preflight found no key,
-skill or delivery platform, no LLM call was made. A quota hold and a gateway shutdown both store
+skill or delivery platform, no LLM call was made; `cancelled` — an operator stopped the run, which
+counts as neither a failure nor a success (0.22.6+). A quota hold and a gateway shutdown both store
 `error`: the hold adds `quota_hold_until`, the shutdown says so in `last_error`.
 
 `state`: `scheduled`, `paused`, `completed` (a finished one-shot), `error` (the next run could not be
 computed — read `last_error`).
 
-`executions.status`: `claimed`, `running`, `completed`, `failed`, `unknown`. Since 0.22.4 an `unknown`
-run can still become `completed` or `failed` when its receipt is reconciled.
+`executions.status`: `claimed`, `running`, `completed`, `failed`, `unknown`, `cancelled`, `missed`. Since
+0.22.4 an `unknown` run can still become `completed` or `failed` when its receipt is reconciled. Since
+0.22.6 one `missed` row books every slot the scheduler skipped (`missed ×N` in `hermes cron runs`): the
+answer to "why did it not fire".
 `executions.delivery_outcome`: `delivered`, `failed`, `not_configured`, `queued`, `suppressed` (silence or
 `local`), `suppressed_acked` (incident acknowledged). Since 0.22.4 a drain writes the real outcome over
 `queued` (on a completed, failed or unknown run) and books a send whose owner died as `failed`; the job
@@ -138,11 +149,11 @@ error maps to the same incident; a successful run resolves open ones.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `catch_up_missed` | `true` | one catch-up run after downtime; `false` skips misses beyond the grace window |
+| `catch_up_missed` | `true` | one catch-up run after downtime; `false` skips misses beyond the grace window; a job's own `catch_up` and `grace_minutes` override it (0.22.6+) |
 | `allow_agent_scheduling` | `false` | give cron sessions the `cronjob` toolset |
 | `preflight` | `true` | check key, skills and delivery before a run → `blocked_config` |
 | `model`, `model_provider` | `""` | model for all unpinned jobs instead of the main one |
-| `wrap_response` | `true` | header with the job name and a footer on delivered replies |
+| `wrap_response` | `true` | header with the job name and a footer on delivered replies; a job's own `wrap_response` overrides it (0.23.2+) |
 | `delivery.notify` | `true` | deliveries with a notification sound (Telegram) |
 | `mirror_delivery` | `false` | let users reply to any delivered brief with its context |
 | `max_parallel_jobs` | unbounded | due jobs run in parallel per tick |
@@ -165,6 +176,10 @@ the global `fallback_providers` chain.
   30 minutes, then the next regular slot. Recurring jobs only (a one-shot has spent its run); the failure
   alert waits while a retry is pending. Off: `cron.retry_unreachable: false`.
 - **Gateway guard.** A job that restarts or stops the gateway is rejected at creation.
+- **Prompt scan at fire time.** The injection scan runs on create, on update and again at every fire, so
+  a stored job can be blocked after an upgrade. In 0.23.3 a prompt with a `curl` that sends a secret
+  variable (`Authorization: Bearer|token $…`, in the URL or the body) is refused for any host, GitHub
+  included; use `gh api` or move the call into a `--script`.
 - **Runs go through the gateway (0.22.4+).** An agent job is admitted and run by the gateway that owns
   the profile's cron store. A tick outside the gateway (`hermes cron tick` from an external scheduler) runs
   only `no_agent` jobs while no gateway is ready (absent, starting, draining or not answering): the
